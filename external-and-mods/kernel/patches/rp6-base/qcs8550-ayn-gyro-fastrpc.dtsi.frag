@@ -14,7 +14,13 @@
 		alloc-ranges = <0x0 0x00000000 0x0 0xffffffff>;
 		alignment = <0x0 0x400000>;
 		size = <0x0 0xc00000>;
-		reusable;
+		/*
+		 * no-map, not reusable: from Linux 7.3.4 / 7.4 fastrpc hands the
+		 * whole region to the ADSP at probe. A reusable (CMA) pool keeps
+		 * lending those pages to Linux, and the board resets under memory
+		 * pressure (issue 102).
+		 */
+		no-map;
 	};
 };
 
