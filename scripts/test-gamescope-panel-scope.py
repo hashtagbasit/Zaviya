@@ -147,3 +147,21 @@ with tempfile.TemporaryDirectory(prefix="panel-scope-") as directory:
                     "-o", str(path / "test")], check=True)
     subprocess.run([str(path / "test")], check=True)
 print("Portal-only EDID and legacy panel refresh checks passed")
+
+build_script = (root / "scripts/build-gamescope-component.sh").read_text()
+export = build_script.split('\ndone\n', 1)[1].split('\ninstall -Dm755', 1)[0]
+with tempfile.TemporaryDirectory(prefix="gamescope-export-") as directory:
+    work = Path(directory)
+    source = work / "install/usr/local/share/gamescope/scripts/00-gamescope/displays"
+    source.mkdir(parents=True)
+    profile = source / "ayn.odin2.portal.lua"
+    output = work / "out"
+    output.mkdir()
+    for contents in ("first build", "updated profile"):
+        profile.write_text(contents)
+        subprocess.run(["bash", "-eu", "-c", export], check=True,
+                       env={**os.environ, "WORK": str(work), "OUT": str(output)})
+        installed = output / "scripts/00-gamescope/displays/ayn.odin2.portal.lua"
+        assert installed.read_text() == contents
+        assert not (output / "scripts/scripts").exists()
+print("Repeated Gamescope script export checks passed")

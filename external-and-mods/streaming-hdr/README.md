@@ -49,6 +49,11 @@ At each stream launch the helper checks the board, stock Steam SDL fingerprint,
 packaged SDL checksum and a real AV1 P010 VA-API config. An incompatible runtime
 uses stock SDL and reports the reason in `streaming_client_box64.log`.
 Create `.no-hdr-box64` in the Steam directory to disable the override.
+If the optional HDR helper is removed, generated wrappers fall back to Box64
+with stock SDL; the capability bridge also migrates older HDR wrappers.
+
+AV1 film-grain synthesis is not supported. Pictures requesting grain are
+rejected rather than leaving the separate display surface unwritten.
 
 Host HDR currently needs **Custom / enabled**. **Match client** did not negotiate
 ten-bit video in the tested setup. Hardware AV1/P010 with an HDR10 swapchain and

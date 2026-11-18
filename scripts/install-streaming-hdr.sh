@@ -13,12 +13,19 @@ import hashlib, json, re, sys
 from pathlib import Path
 root = Path(sys.argv[1])
 manifest = json.loads((root / "manifest.json").read_text())
+if not isinstance(manifest, dict):
+    raise ValueError("Invalid SDL manifest: expected an object")
 for key in ("steam_sdl_sha256", "libSDL3_sha256"):
-    assert re.fullmatch("[0-9a-f]{64}", manifest[key]), f"Invalid {key}"
+    value = manifest.get(key)
+    if not isinstance(value, str) or not re.fullmatch("[0-9a-f]{64}", value):
+        raise ValueError(f"Invalid {key}")
 library = (root / "libSDL3.so.0").read_bytes()
-assert library[:6] == b"\x7fELF\x02\x01" and library[18:20] == b"\x3e\x00", "Invalid SDL architecture"
-assert hashlib.sha256(library).hexdigest() == manifest["libSDL3_sha256"], "SDL hash mismatch"
-assert (root / "LICENSE.txt").stat().st_size, "Missing SDL license"
+if library[:6] != b"\x7fELF\x02\x01" or library[18:20] != b"\x3e\x00":
+    raise ValueError("Invalid SDL architecture")
+if hashlib.sha256(library).hexdigest() != manifest["libSDL3_sha256"]:
+    raise ValueError("SDL hash mismatch")
+if not (root / "LICENSE.txt").stat().st_size:
+    raise ValueError("Missing SDL license")
 PY
 DEST="$R/usr/lib/steamos/streaming-hdr"
 install -D -m755 "$BUNDLE/libSDL3.so.0" "$DEST/libSDL3.so.0"

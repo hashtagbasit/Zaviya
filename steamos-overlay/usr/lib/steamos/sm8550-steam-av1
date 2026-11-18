@@ -11,6 +11,7 @@ import mmap
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import sys
 import tempfile
@@ -42,7 +43,8 @@ BRIDGE = BEGIN + """((remote) => {
 HDR_LAUNCHER = Path("/usr/lib/steamos/sm8550-streaming-client")
 
 
-def launcher_source(root, hdr=False):
+def legacy_launcher_source(root, hdr=False):
+    """Recognize old wrapper bytes for migration, never for installation."""
     command = (f'{HDR_LAUNCHER} "$S"' if hdr else
                'box64 "$S/steamrt64/streaming_client"')
     return f"""#!/bin/sh
@@ -52,6 +54,41 @@ exec env BOX64_EMULATED_LIBS=libSDL3_ttf.so.0 \\
   BOX64_LD_LIBRARY_PATH="$S/steamrt64:$S/ubuntu12_64:$S/linux64" \\
   {command} "$@" >"$S/logs/streaming_client_box64.log" 2>&1
 """
+
+
+def launcher_source(root, hdr=False):
+    quoted_root = "'" + str(root).replace("'", "'\\''") + "'"
+    environment = """env BOX64_EMULATED_LIBS=libSDL3_ttf.so.0 \\
+  BOX64_LD_LIBRARY_PATH="$S/steamrt64:$S/ubuntu12_64:$S/linux64" \\
+  """
+    redirect = ' "$@" >"$S/logs/streaming_client_box64.log" 2>&1\n'
+    source = f"""#!/bin/sh
+# PYROWAVE_BOX64_WRAPPER (written by RUNSTEAM.sh; remove .pyrowave-box64 to undo)
+S={quoted_root}
+"""
+    if hdr:
+        helper = shlex.quote(str(HDR_LAUNCHER))
+        source += (f"if [ -x {helper} ]; then\n"
+                   f'  exec {environment}{helper} "$S"{redirect}fi\n')
+    return source + f'exec {environment}box64 "$S/steamrt64/streaming_client"{redirect}'
+
+
+def known_launchers(root, hdr):
+    return (launcher_source(root, hdr=hdr).encode(),
+            legacy_launcher_source(root, hdr=hdr).encode())
+
+
+def reconcile_launcher(root, runtime):
+    wrapper = root / runtime / "streaming_client"
+    if not wrapper.is_file():
+        return
+    with wrapper.open("rb") as stream:
+        contents = stream.read(4097)
+    hdr = contents in known_launchers(root, hdr=True)
+    if hdr or contents in known_launchers(root, hdr=False):
+        source = launcher_source(root, hdr=hdr and os.access(HDR_LAUNCHER, os.X_OK))
+        if contents != source.encode():
+            replace_source(wrapper, source)
 
 
 def uses_box64_client(root, runtime):
@@ -64,9 +101,7 @@ def uses_box64_client(root, runtime):
     with wrapper.open("rb") as stream:
         contents = stream.read(4097)
     # Only the stock launcher and our guarded SDL launcher use this VA-API path.
-    known = [launcher_source(root).encode()]
-    if os.access(HDR_LAUNCHER, os.X_OK):
-        known.append(launcher_source(root, hdr=True).encode())
+    known = known_launchers(root, hdr=False) + known_launchers(root, hdr=True)
     if contents not in known:
         return False
     with client.open("rb") as stream:
@@ -159,6 +194,8 @@ def replace_source(path, source):
 
 
 def main(root, runtime):
+    # Persistent Steam wrappers can outlive the optional system HDR installation.
+    reconcile_launcher(root, runtime)
     path = root / "steamui/sp.js"
     if not path.is_file():
         raise FileNotFoundError(f"Steam shared UI is missing: {path}")
@@ -187,7 +224,7 @@ if __name__ == "__main__":
     try:
         if len(sys.argv) != 3 or sys.argv[2] not in ("steamrtarm64", "linuxarm64"):
             raise ValueError("usage: sm8550-steam-av1 <Steam root> <ARM runtime>")
-        main(Path(sys.argv[1]).resolve(), sys.argv[2])
+        main(Path(sys.argv[1]), sys.argv[2])
     except (OSError, RuntimeError, ValueError) as error:
         print(f"SteamOS ARM: AV1 capability bridge unavailable: {error}",
               file=sys.stderr)

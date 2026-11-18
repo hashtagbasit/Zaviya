@@ -57,7 +57,8 @@ meson install -C "$WORK/build" --no-rebuild --destdir "$WORK/install"
 for binary in gamescope gamescopectl gamescopereaper gamescopestream; do
     install -Dm755 "$WORK/build/src/$binary" "$OUT/src/$binary"
 done
-cp -a "$WORK/install/usr/local/share/gamescope/scripts" "$OUT/scripts"
+mkdir -p "$OUT/scripts"
+cp -a "$WORK/install/usr/local/share/gamescope/scripts/." "$OUT/scripts/"
 install -Dm755 "$WORK/build/layer/libVkLayer_FROG_gamescope_wsi_aarch64.so" \
     "$OUT/layer/libVkLayer_FROG_gamescope_wsi_aarch64.so"
 python3 - "$WORK/build/layer/VkLayer_FROG_gamescope_wsi.aarch64.json" "$OUT/layer" <<'PY'

@@ -2,6 +2,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -32,13 +33,16 @@ class SteamAV1Tests(unittest.TestCase):
                 bridge.adapt_source(source, True)
 
     def make_client(self, root):
+        root.mkdir(exist_ok=True)
         (root / ".pyrowave-box64").touch()
         wrapper = root / "steamrtarm64/streaming_client"
         wrapper.parent.mkdir()
         launcher = (ROOT / "steamos-overlay/usr/share/deckard/RUNSTEAM.sh").read_text()
         template = launcher.split('cat >"${_sc}" <<EOF || true\n', 1)[1].split("\nEOF", 1)[0]
+        quoting = launcher.split("    _sc_root=", 1)[1].splitlines()[0]
         generated = subprocess.run(
-            ["bash", "-c", "STEAMROOT=$1\ncat <<EOF\n" + template + "\nEOF",
+            ["bash", "-c", "STEAMROOT=$1\n_sc_root=" + quoting +
+             "\ncat <<EOF\n" + template + "\nEOF",
              "wrapper", str(root)], check=True, capture_output=True,
         )
         wrapper.write_bytes(generated.stdout)
@@ -79,17 +83,80 @@ class SteamAV1Tests(unittest.TestCase):
             self.assertFalse(bridge.uses_box64_client(root, "steamrtarm64"))
 
     @mock.patch.object(bridge.shutil, "which", return_value="/usr/bin/box64")
-    def test_guarded_hdr_launcher_is_recognized_only_when_installed(self, which):
+    def test_hdr_launcher_is_recognized_and_downgraded_before_probe_failure(self, which):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             wrapper, _ = self.make_client(root)
             helper = root / "hdr-helper"
             helper.touch(mode=0o755)
-            with mock.patch.object(bridge, "HDR_LAUNCHER", helper):
-                wrapper.write_text(bridge.launcher_source(root, hdr=True))
-                self.assertTrue(bridge.uses_box64_client(root, "steamrtarm64"))
+            path = root / "steamui/sp.js"
+            path.parent.mkdir()
+            path.write_text(bridge.CALL + "(cb);")
+            with mock.patch.object(bridge, "HDR_LAUNCHER", helper), \
+                    mock.patch.object(bridge.Path, "glob", return_value=[Path("/dev/dri/renderD128")]), \
+                    mock.patch.object(bridge, "probe_av1", side_effect=RuntimeError("unsupported")):
+                sources = bridge.known_launchers(root, hdr=True)
                 helper.unlink()
-                self.assertFalse(bridge.uses_box64_client(root, "steamrtarm64"))
+                for source in sources:
+                    with self.subTest(source=source):
+                        wrapper.write_bytes(source)
+                        self.assertTrue(bridge.uses_box64_client(root, "steamrtarm64"))
+                        with self.assertRaisesRegex(RuntimeError, "unsupported"):
+                            bridge.main(root, "steamrtarm64")
+                        self.assertEqual(wrapper.read_text(), bridge.launcher_source(root))
+
+    @mock.patch.object(bridge.shutil, "which", return_value="/usr/bin/box64")
+    def test_shell_quoting_and_missing_helper_inline_fallback(self, which):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "Steam's $library"
+            wrapper, _ = self.make_client(root)
+            self.assertEqual(wrapper.read_text(), bridge.launcher_source(root))
+            self.assertTrue(bridge.uses_box64_client(root, "steamrtarm64"))
+            (root / "logs").mkdir()
+            tools = root / "bin"
+            tools.mkdir()
+            box64 = tools / "box64"
+            box64.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+            box64.chmod(0o755)
+            with mock.patch.object(bridge, "HDR_LAUNCHER", root / "missing helper"):
+                for hdr in (False, True):
+                    wrapper.write_text(bridge.legacy_launcher_source(root, hdr=hdr))
+                    bridge.reconcile_launcher(root, "steamrtarm64")
+                    self.assertEqual(wrapper.read_text(), bridge.launcher_source(root))
+                for hdr in (False, True):
+                    wrapper.write_text(bridge.launcher_source(root, hdr=hdr))
+                    subprocess.run([str(wrapper), "argument's $value"], check=True,
+                                   env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"})
+                    self.assertEqual(
+                        (root / "logs/streaming_client_box64.log").read_text(),
+                        f"{root}/steamrt64/streaming_client\nargument's $value\n",
+                    )
+
+    def test_cli_preserves_symlink_root_for_wrapper_recognition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            real = Path(directory) / "real"
+            real.mkdir()
+            root = Path(directory) / "steam"
+            root.symlink_to(real, target_is_directory=True)
+            self.make_client(root)
+            path = root / "steamui/sp.js"
+            path.parent.mkdir()
+            path.write_text(bridge.CALL + "(cb);")
+            program = """
+import runpy, sys
+from pathlib import Path
+from unittest import mock
+script, root = sys.argv[1:]
+sys.argv = [script, root, "steamrtarm64"]
+with mock.patch("shutil.which", return_value="/usr/bin/box64"), \\
+     mock.patch.object(Path, "glob", return_value=[]):
+    runpy.run_path(script, run_name="__main__")
+"""
+            result = subprocess.run(["python3", "-c", program, str(MODULE), str(root)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("requires one unambiguous DRM render device", result.stderr)
+            self.assertNotIn("native/unknown streaming client", result.stdout)
 
     @mock.patch.object(bridge.shutil, "which", return_value="/usr/bin/box64")
     def test_stock_launcher_is_upgraded_without_losing_av1(self, which):

@@ -116,10 +116,23 @@ class StreamingHDRTests(unittest.TestCase):
             self.assertIn("using stock SDL: unsupported", stderr.getvalue())
             self.assertNotIn("BOX64_LD_PRELOAD", execute.call_args.args[2])
 
-    def install(self, bundle=None):
+    @mock.patch.object(client.os, "execvpe")
+    def test_non_object_manifest_falls_back_to_stock_client(self, execute):
+        for manifest in (None, [], ["unexpected"], 1, "unexpected"):
+            with self.subTest(manifest=manifest), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as stderr, \
+                    mock.patch.dict(os.environ, {}, clear=True):
+                (self.bundle / "manifest.json").write_text(json.dumps(manifest))
+                client.main(self.root, ["--example"])
+                self.assertIn("expected an object", stderr.getvalue())
+                self.assertEqual(execute.call_args.args[0], "box64")
+                self.assertNotIn("BOX64_LD_PRELOAD", execute.call_args.args[2])
+
+    def install(self, bundle=None, optimize=0):
         return subprocess.run(
             ["bash", str(INSTALLER), str(self.rootfs)], capture_output=True, text=True,
-            env={**os.environ, "STREAMING_HDR_BUILD": str(bundle or self.bundle)},
+            env={**os.environ, "STREAMING_HDR_BUILD": str(bundle or self.bundle),
+                 "PYTHONOPTIMIZE": str(optimize)},
         )
 
     def test_installs_complete_bundle_and_startup_integration(self):
@@ -152,10 +165,30 @@ class StreamingHDRTests(unittest.TestCase):
                     path.write_bytes(saved)
 
     def test_corrupt_bundle_fails_before_installing_anything(self):
-        (self.bundle / "libSDL3.so.0").write_bytes(b"corrupt")
-        result = self.install()
+        library = self.bundle / "libSDL3.so.0"
+        original = library.read_bytes()
+        for optimize in (0, 1):
+            for contents in (b"corrupt", original + b"bad hash"):
+                with self.subTest(optimize=optimize, contents=contents):
+                    library.write_bytes(contents)
+                    result = self.install(optimize=optimize)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertTrue(result.stderr)
+                    self.assertFalse(list(self.rootfs.iterdir()))
+
+    def test_optimized_installer_validates_manifest_and_license(self):
+        for manifest in (None, [], {**self.manifest, "steam_sdl_sha256": 1},
+                         {**self.manifest, "steam_sdl_sha256": "invalid"}):
+            with self.subTest(manifest=manifest):
+                (self.bundle / "manifest.json").write_text(json.dumps(manifest))
+                result = self.install(optimize=1)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(list(self.rootfs.iterdir()))
+        (self.bundle / "manifest.json").write_text(json.dumps(self.manifest))
+        (self.bundle / "LICENSE.txt").write_text("")
+        result = self.install(optimize=1)
         self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(result.stderr)
+        self.assertIn("Missing SDL license", result.stderr)
         self.assertFalse(list(self.rootfs.iterdir()))
 
     def test_explicit_missing_bundle_fails(self):

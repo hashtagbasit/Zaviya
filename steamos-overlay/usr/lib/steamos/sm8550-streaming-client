@@ -19,6 +19,8 @@ def hdr_library(root):
     if b"ayn,odin2portal" not in BOARD.read_bytes().split(b"\0"):
         return None
     manifest = json.loads((BUNDLE / "manifest.json").read_text())
+    if not isinstance(manifest, dict):
+        raise ValueError("Invalid SDL manifest: expected an object")
     library = BUNDLE / "libSDL3.so.0"
     for path, key in ((root / "steamrt64/libSDL3.so.0", "steam_sdl_sha256"),
                       (library, "libSDL3_sha256")):
