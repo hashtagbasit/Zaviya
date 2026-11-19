@@ -20,6 +20,7 @@ jobs:
       android: ${{ steps.filter.outputs.android }}
       shell: ${{ steps.filter.outputs.shell }}
       overlay: ${{ steps.filter.outputs.overlay }}
+      vaapi: ${{ steps.filter.outputs.vaapi }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,6 +48,7 @@ jobs:
             echo "android=$(match '^(android-installer/|\.github/workflows/ci\.yml$)')"
             echo "overlay=$(match '(-overlay/|^scripts/|^tests/|^make-steamos-.*\.sh$|^\.github/workflows/ci\.yml$)')"
             echo "shell=$(match '(\.sh$|^scripts/|-overlay/|^external-and-mods/ufs-install/|^\.github/workflows/ci\.yml$)')"
+            echo "vaapi=$(match '(^external-and-mods/v4l2-vaapi/|^\.github/workflows/ci\.yml$)')"
           } >> "$GITHUB_OUTPUT"
 
   installer-tests:
@@ -83,7 +85,34 @@ jobs:
       - name: Install test dependencies
         run: python3 -m pip install --disable-pip-version-check pytest pyyaml
       - name: Run overlay checks
-        run: python3 -m pytest -q tests/test_overlay_checks.py tests/test_space_guard.py tests/test_logs.py tests/test_update_preserve.py tests/test_thor_panels.py
+        run: python3 -m pytest -q tests/test_overlay_checks.py tests/test_space_guard.py tests/test_logs.py tests/test_update_preserve.py tests/test_thor_panels.py tests/test_video_accel.py
+
+  vaapi-tests:
+    needs: changes
+    if: needs.changes.outputs.vaapi == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc libva-dev patchelf
+      - name: Build VA-API bridge and GBM shim
+        run: INSIDE=1 OUT="$RUNNER_TEMP/vaapi" bash external-and-mods/v4l2-vaapi/build.sh
+      - name: Check HEVC bitstreams and surface formats
+        shell: bash
+        run: |
+          # Fail on sanitizer findings instead of continuing through invalid nonnull arguments.
+          flags="-g -O1 -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -fno-sanitize-recover=all"
+          gcc $flags external-and-mods/v4l2-vaapi/tests/hevc.c -o /tmp/test-hevc
+          /tmp/test-hevc
+          gcc $flags external-and-mods/v4l2-vaapi/tests/dec.c -lpthread -o /tmp/test-dec
+          /tmp/test-dec
+          gcc $flags external-and-mods/v4l2-vaapi/tests/formats.c \
+            external-and-mods/v4l2-vaapi/src/{dec,h264,hevc}.c -lpthread -o /tmp/test-formats
+          /tmp/test-formats
+          gcc $flags external-and-mods/v4l2-vaapi/tests/gbm.c -ldl -lpthread -o /tmp/test-gbm
+          /tmp/test-gbm
 
   android-tests:
     needs: changes

@@ -23,9 +23,11 @@
 #include <stddef.h>
 #include <va/va.h>
 #include <va/va_backend.h>
+#include <va/va_dec_hevc.h>
 #include <va/va_drmcommon.h>
+#include "../formats.h"
 
-#define MAX_PROFILES 4
+#define MAX_PROFILES 5
 #define MAX_SLOTS 32
 #define NUM_OUT_BUFS 6
 #define MAX_INFLIGHT 64
@@ -42,6 +44,8 @@ struct drv {
 	pthread_mutex_t lock;
 	int render_fd;               /* our own render node, never the client's */
 	char dec_path[32];           /* /dev/videoN of the decoder */
+	int hevc;
+	int p010;                    /* linear 10-bit capture is available */
 	struct obj_table tab[O_MAX];
 	int debug;
 	FILE *log;
@@ -52,12 +56,14 @@ struct drv {
 struct config {
 	VAProfile profile;
 	VAEntrypoint entrypoint;
+	uint32_t rt_format;
 };
 
 struct context;
 
 struct surface {
 	uint32_t width, height;      /* as created */
+	uint32_t fourcc;
 	uint32_t pitch;              /* luma and chroma row pitch */
 	uint32_t uv_offset;
 	uint32_t size;
@@ -97,6 +103,7 @@ struct context {
 	int decode_order;            /* firmware returns pictures in decode order */
 	int late_output;             /* pictures come back a frame late: don't wait for them */
 	uint32_t cap_pitch, cap_height, cap_size, cap_count;
+	uint32_t cap_fourcc;
 	void *cap_map[MAX_SLOTS];
 	struct surface *slot_owner[MAX_SLOTS];
 	unsigned next_slot;
@@ -104,6 +111,7 @@ struct context {
 
 	/* picture being built */
 	struct surface *target;
+	int picture_failed;
 	VAPictureParameterBufferH264 pic;
 	int have_pic;
 	VAIQMatrixBufferH264 iq;
@@ -121,6 +129,11 @@ struct context {
 	uint8_t pps[256][720];
 	uint16_t pps_len[256];
 	struct pps_learned learned[256];
+
+	VAPictureParameterBufferHEVC hevc;
+	VAIQMatrixBufferHEVC hevc_iq;
+	VASliceParameterBufferHEVC *hevc_slices;
+	unsigned hevc_nslices;
 
 	uint64_t seq;
 	uint64_t frames;
@@ -157,10 +170,22 @@ int h264_parse_slice(struct context *c, const VASliceParameterBufferH264 *sp,
 size_t h264_write_sps(const struct context *c, uint8_t *out, size_t cap);
 size_t h264_write_pps(const struct context *c, int pps_id, uint8_t *out, size_t cap);
 
+/* hevc.c */
+static inline int hevc_profile(VAProfile profile)
+{
+	return profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10;
+}
+int hevc_validate(const struct context *c);
+int hevc_add_slices(struct context *c, const struct buffer *data);
+size_t hevc_build(struct context *c, uint8_t **out);
+
 /* dec.c */
+int dec_has_hevc(const char *path);
+int dec_has_p010(const char *path);
 int dec_find(char *path, size_t len);
 int dec_open(struct context *c);
 void dec_close(struct context *c);
+int dec_reset(struct context *c);
 int dec_submit(struct context *c, const uint8_t *data, size_t len, struct surface *target);
 int dec_wait(struct context *c, struct surface *s, int timeout_ms);
 int surf_map(struct surface *s);
