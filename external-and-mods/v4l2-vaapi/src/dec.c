@@ -41,6 +41,7 @@ static int dec_has_format(const char *path, uint32_t type, uint32_t format)
 	if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
 		struct v4l2_format output = {.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE};
 		output.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_HEVC;
+		output.fmt.pix_mp.num_planes = 1;
 		if (xioctl(fd, VIDIOC_S_FMT, &output) ||
 		    output.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_HEVC)
 			goto done;

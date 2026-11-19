@@ -105,6 +105,7 @@ static int test_ioctl(int fd, unsigned long request, ...)
 		struct v4l2_format *f = arg;
 		if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
 			assert(f->fmt.pix_mp.pixelformat == codec);
+			assert(f->fmt.pix_mp.num_planes == 1);
 			if (reject_output)
 				return -1;
 			output_set = 1;
