@@ -39,6 +39,7 @@
 !/tests/test_logs.py
 !/tests/test_update_preserve.py
 !/tests/test_thor_panels.py
+!/tests/test_gpu_worker_pin.py
 /.version
 
 # Kernel build output

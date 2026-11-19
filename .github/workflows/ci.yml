@@ -68,6 +68,8 @@ jobs:
         run: python3 -m unittest -v tests.test_button_remap
       - name: Run input and sleep tests
         run: python3 -m unittest -v tests.test_input_sleep
+      - name: Run gpu-worker placement tests
+        run: python3 -m unittest -v tests.test_gpu_worker_pin
 
   overlay-checks:
     needs: changes

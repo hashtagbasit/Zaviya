@@ -791,6 +791,69 @@ def pin_gpu_irqs() -> None:
             log(f"gpu irq {irq} -> cpus {want}")
 
 
+# msm's "gpu-worker" kernel thread (SCHED_FIFO) retires finished GPU jobs. The
+# Wi-Fi receive interrupts stay on the little cores (irqaffinity=0-2), and when
+# a stream's receive softirq runs on the CPU this thread sits on, the thread
+# waits behind it: a Moonlight stream on the Odin 2 Portal then misses about
+# three times as many refreshes. Keep it on the middle cores, next to the GPU
+# interrupts above, but not on the prime core, the hottest one. SM8550 only.
+PF_KTHREAD = 0x00200000
+
+
+def kthread_comm(stat_path: str) -> bytes:
+    """A kernel thread's comm from /proc/<pid>/stat, b"" for anything else.
+    comm is raw bytes any process can set on itself, so the kernel-thread flag
+    (field 9) decides, and the name is compared as bytes, never decoded."""
+    try:
+        with open(stat_path, "rb") as fh:
+            stat = fh.read()
+        r = stat.rfind(b")")
+        flags = int(stat[r + 2:].split()[6])
+    except (OSError, ValueError, IndexError):
+        return b""
+    return stat[stat.find(b"(") + 1:r] if flags & PF_KTHREAD else b""
+
+
+def cpu_ranks() -> dict[int, int]:
+    """Every CPU ranked from one source: cpu_capacity, else cpuinfo_max_freq.
+    {} when neither is readable on all CPUs, so a capacity is never compared
+    with a frequency (big_cpus() falls back per CPU, which can put a little
+    core with an unreadable capacity above the others)."""
+    cpus = sorted(int(os.path.basename(c)[3:]) for c in glob.glob("/sys/devices/system/cpu/cpu[0-9]*")
+                  if os.path.basename(c)[3:].isdigit())
+    for attr in ("cpu_capacity", "cpufreq/cpuinfo_max_freq"):
+        vals = [rd(f"/sys/devices/system/cpu/cpu{c}/{attr}") for c in cpus]
+        if cpus and all(v.isdigit() and int(v) > 0 for v in vals):
+            return dict(zip(cpus, map(int, vals)))
+    return {}
+
+
+def pin_gpu_worker() -> None:
+    if not is_sm8550():
+        return
+    # The little and prime tiers come from one ranking of every CPU. When no
+    # source covers them all, or all CPUs rank the same, the tiers are
+    # unknown: leave the thread where it is.
+    ranks = cpu_ranks()
+    if not ranks:
+        return
+    low, top = min(ranks.values()), max(ranks.values())
+    big = {c for c, v in ranks.items() if v > low}
+    if not big:
+        return
+    want = {c for c in big if ranks[c] < top} or big
+    for stat in glob.glob("/proc/[0-9]*/stat"):
+        if kthread_comm(stat) != b"gpu-worker":
+            continue
+        pid = int(stat.split("/")[2])
+        try:
+            if os.sched_getaffinity(pid) != want:
+                os.sched_setaffinity(pid, want)
+                log(f"gpu-worker {pid} -> cpus {','.join(str(c) for c in sorted(want))}")
+        except OSError:
+            pass
+
+
 def ensure_webhelper_vulkan() -> None:
     """Re-apply the ANGLE-Vulkan flags if a Steam client update rewrote the
     launcher (Steam restarts the UI on its own after updates)."""
@@ -1721,6 +1784,7 @@ class Daemon:
                 next_ui_check = now + 60.0
                 ensure_webhelper_vulkan()
                 pin_gpu_irqs()
+                pin_gpu_worker()
                 record_wifi()
                 if not os.path.exists(STANDBY_FLAG):
                     ensure_gamepad_mode(self.conf)
