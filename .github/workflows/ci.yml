@@ -102,8 +102,8 @@ jobs:
       - name: Check HEVC bitstreams and surface formats
         shell: bash
         run: |
-          # ASan checks bounds; avoid GCC's false null-format diagnostic in fortified vfprintf.
-          flags="-g -O1 -Wall -Wextra -Werror -Wno-unused-parameter -U_FORTIFY_SOURCE -fsanitize=address,undefined"
+          # Fail on sanitizer findings instead of continuing through invalid nonnull arguments.
+          flags="-g -O1 -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -fno-sanitize-recover=all"
           gcc $flags external-and-mods/v4l2-vaapi/tests/hevc.c -o /tmp/test-hevc
           /tmp/test-hevc
           gcc $flags external-and-mods/v4l2-vaapi/tests/formats.c \
