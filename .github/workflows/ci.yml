@@ -106,6 +106,8 @@ jobs:
           flags="-g -O1 -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -fno-sanitize-recover=all"
           gcc $flags external-and-mods/v4l2-vaapi/tests/hevc.c -o /tmp/test-hevc
           /tmp/test-hevc
+          gcc $flags external-and-mods/v4l2-vaapi/tests/dec.c -lpthread -o /tmp/test-dec
+          /tmp/test-dec
           gcc $flags external-and-mods/v4l2-vaapi/tests/formats.c \
             external-and-mods/v4l2-vaapi/src/{dec,h264,hevc}.c -lpthread -o /tmp/test-formats
           /tmp/test-formats

@@ -38,10 +38,18 @@ static int dec_has_format(const char *path, uint32_t type, uint32_t format)
 	int fd = open(path, O_RDWR | O_CLOEXEC), ok = 0;
 	if (fd < 0)
 		return 0;
+	if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+		struct v4l2_format output = {.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE};
+		output.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_HEVC;
+		if (xioctl(fd, VIDIOC_S_FMT, &output) ||
+		    output.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_HEVC)
+			goto done;
+	}
 	struct v4l2_fmtdesc f = {.type = type};
 	for (f.index = 0; !xioctl(fd, VIDIOC_ENUM_FMT, &f); f.index++)
 		if (f.pixelformat == format)
 			ok = 1;
+done:
 	close(fd);
 	return ok;
 }
@@ -173,6 +181,8 @@ static void cap_release(struct context *c)
 		.memory = c->copy_mode ? V4L2_MEMORY_MMAP : V4L2_MEMORY_DMABUF};
 	xioctl(c->fd, VIDIOC_REQBUFS, &rb);
 	c->cap_ready = 0;
+	c->cap_count = 0;
+	c->next_slot = 0;
 }
 
 void dec_close(struct context *c)
@@ -183,11 +193,36 @@ void dec_close(struct context *c)
 		cap_release(c);
 	int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	xioctl(c->fd, VIDIOC_STREAMOFF, &type);
-	for (int i = 0; i < c->out_count; i++)
+	for (int i = 0; i < c->out_count; i++) {
 		if (c->out[i].map)
 			munmap(c->out[i].map, c->out[i].len);
+		c->out[i].map = NULL;
+		c->out[i].len = 0;
+		c->out[i].queued = 0;
+	}
+	c->out_count = 0;
 	close(c->fd);
 	c->fd = -1;
+}
+
+int dec_reset(struct context *c)
+{
+	for (unsigned i = 0; i < MAX_INFLIGHT; i++) {
+		struct surface *s = c->inflight[i];
+		if (s && s->pending) {
+			s->pending = 0;
+			s->error = 1;
+		}
+		c->inflight[i] = NULL;
+	}
+	dec_close(c);
+	c->newest = NULL;
+	c->late_output = 0;
+	c->failed = 1;
+	if (dec_open(c))
+		return -1;
+	c->failed = 0;
+	return 0;
 }
 
 static int layout_fits(const struct surface *s, uint32_t pitch, uint32_t height)
@@ -399,21 +434,24 @@ static int cap_setup(struct context *c, struct surface *target)
 			struct v4l2_buffer b = {.index = i, .type = rb.type, .memory = rb.memory,
 				.m.planes = pl, .length = 1};
 			if (xioctl(c->fd, VIDIOC_QUERYBUF, &b))
-				return -1;
+				goto fail;
 			void *m = mmap(NULL, pl[0].length, PROT_READ, MAP_SHARED, c->fd,
 				       pl[0].m.mem_offset);
 			if (m == MAP_FAILED)
-				return -1;
+				goto fail;
 			c->cap_map[i] = m;
 			if (queue_cap_slot(c, i))
-				return -1;
+				goto fail;
 		}
 	}
 	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	if (xioctl(c->fd, VIDIOC_STREAMON, &type))
-		return -1;
+		goto fail;
 	c->cap_ready = 1;
 	return 0;
+fail:
+	cap_release(c);
+	return -1;
 }
 
 static int bind_target(struct context *c, struct surface *s)
@@ -541,6 +579,8 @@ int dec_submit(struct context *c, const uint8_t *data, size_t len, struct surfac
 		if (wait_event(c, 2000) || cap_setup(c, target)) {
 			dbg(c->drv, "decoder never reported a format");
 			c->failed = 1;
+			target->pending = 0;
+			target->error = 1;
 			return -1;
 		}
 		if (!c->copy_mode && bind_target(c, target))
