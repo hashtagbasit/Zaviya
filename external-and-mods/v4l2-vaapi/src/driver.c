@@ -784,6 +784,7 @@ static VAStatus BeginPicture(VADriverContextP ctx, VAContextID cid, VASurfaceID 
 		dec_wait(c, s, 1000);
 	s->ctx = c;
 	c->target = s;
+	c->picture_failed = 0;
 	c->have_iq = 0;
 	c->nslices = 0;
 	c->nal_len = 0;
@@ -859,9 +860,6 @@ static VAStatus render_av1(struct context *c, struct buffer *b)
 		if (c->av1.film_grain_info.film_grain_info_fields.bits.apply_grain)
 			return VA_STATUS_ERROR_UNIMPLEMENTED;
 		c->have_pic = 1;
-		/* Clients flush in place; a shown key frame restores all references. */
-		if (c->av1.pic_info_fields.bits.frame_type == 0 && c->av1.pic_info_fields.bits.show_frame)
-			c->failed = 0;
 		break;
 	case VASliceParameterBufferType: {
 		VASliceParameterBufferAV1 *ns = realloc(c->av1_slices, b->num * sizeof(*ns));
@@ -886,7 +884,12 @@ static VAStatus end_av1(struct drv *d, struct context *c)
 {
 	uint8_t *frame = NULL;
 	VAStatus st = VA_STATUS_ERROR_DECODING_ERROR;
-	if (c->have_pic && !c->failed && !av1_finish_refs(c)) {
+	if (c->av1_nslices)
+		c->picture_failed = 1;
+	if (c->have_pic && c->av1_ntiles && !c->picture_failed && c->failed &&
+	    c->av1.pic_info_fields.bits.frame_type == 0 && c->av1.pic_info_fields.bits.show_frame)
+		dec_reset(c);
+	if (c->have_pic && !c->failed && !c->picture_failed && !av1_finish_refs(c)) {
 		size_t n = av1_build(c, &frame);
 		if (n && !dec_submit(c, frame, n, c->target) &&
 		    !dec_wait(c, c->target, 1000))
@@ -895,6 +898,7 @@ static VAStatus end_av1(struct drv *d, struct context *c)
 	free(frame);
 	if (st != VA_STATUS_SUCCESS) {
 		c->target->error = 1;
+		c->target->pending = 0;
 		c->failed = 1;
 	}
 	return st;
@@ -946,6 +950,8 @@ static VAStatus RenderPicture(VADriverContextP ctx, VAContextID cid, VABufferID 
 			break;                         /* e.g. probability tables we don't need */
 		}
 	}
+	if (c && st != VA_STATUS_SUCCESS)
+		c->picture_failed = 1;
 	UNLOCK(d);
 	return st;
 }
@@ -965,10 +971,15 @@ static VAStatus EndPicture(VADriverContextP ctx, VAContextID cid)
 		UNLOCK(d);
 		return st;
 	}
-	if (c->failed && c->idr)
-		c->failed = 0;
+	if (c->nslices)
+		c->picture_failed = 1;
+	if (c->failed && c->idr && c->nal_len && !c->picture_failed)
+		dec_reset(c);
+	if (c->picture_failed)
+		c->failed = 1;
 	if (c->failed || !c->nal_len) {
 		c->target->error = 1;
+		c->target->pending = 0;
 		UNLOCK(d);
 		return c->failed ? VA_STATUS_ERROR_DECODING_ERROR : VA_STATUS_SUCCESS;
 	}
@@ -1221,8 +1232,6 @@ static VAStatus GetImage(VADriverContextP ctx, VASurfaceID sid, int x, int y, un
 	    w > s->width - (uint32_t)x || h > s->height - (uint32_t)y ||
 	    w > i->va.width || h > i->va.height)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
-	x &= ~1;
-	y &= ~1;
 	struct dma_buf_sync sy = {.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
 	ioctl(s->fd, DMA_BUF_IOCTL_SYNC, &sy);
 	const uint8_t *src = (const uint8_t *)s->map;
@@ -1232,7 +1241,7 @@ static VAStatus GetImage(VADriverContextP ctx, VASurfaceID sid, int x, int y, un
 		       src + (size_t)(y + r) * s->pitch + (size_t)x * bytes, w * bytes);
 	for (unsigned r = 0; r < (h + 1) / 2; r++)
 		memcpy(b->data + i->va.offsets[1] + (size_t)r * i->va.pitches[1],
-		       src + s->uv_offset + (size_t)(y / 2 + r) * s->pitch + (size_t)x * bytes,
+		       src + s->uv_offset + (size_t)(y / 2 + r) * s->pitch + (size_t)(x & ~1) * bytes,
 		       ALIGN(w, 2) * bytes);
 	sy.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
 	ioctl(s->fd, DMA_BUF_IOCTL_SYNC, &sy);

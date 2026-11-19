@@ -200,11 +200,42 @@ void dec_close(struct context *c)
 		cap_release(c);
 	int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	xioctl(c->fd, VIDIOC_STREAMOFF, &type);
-	for (int i = 0; i < c->out_count; i++)
+	for (int i = 0; i < c->out_count; i++) {
 		if (c->out[i].map)
 			munmap(c->out[i].map, c->out[i].len);
+		c->out[i].map = NULL;
+		c->out[i].len = 0;
+		c->out[i].queued = 0;
+	}
+	c->out_count = 0;
 	close(c->fd);
 	c->fd = -1;
+}
+
+int dec_reset(struct context *c)
+{
+	for (unsigned i = 0; i < MAX_INFLIGHT; i++) {
+		struct surface *s = c->inflight[i];
+		if (s && s->pending) {
+			s->pending = 0;
+			s->error = 1;
+		}
+		c->inflight[i] = NULL;
+	}
+	dec_close(c);
+	c->newest = NULL;
+	c->late_output = 0;
+	c->cap_format_known = 0;
+	memset(c->av1_slot, 0, sizeof(c->av1_slot));
+	memset(c->av1_refs, 0, sizeof(c->av1_refs));
+	free(c->av1_deferred.data);
+	memset(&c->av1_deferred, 0, sizeof(c->av1_deferred));
+	c->av1_seq_len = 0;
+	c->failed = 1;
+	if (dec_open(c))
+		return -1;
+	c->failed = 0;
+	return 0;
 }
 
 static int layout_fits(const struct surface *s, uint32_t pitch, uint32_t height)
