@@ -219,6 +219,8 @@ int dec_reset(struct context *c)
 	dec_close(c);
 	c->newest = NULL;
 	c->late_output = 0;
+	c->sps_len = 0;
+	memset(c->pps_len, 0, sizeof(c->pps_len));
 	c->failed = 1;
 	if (dec_open(c))
 		return -1;

@@ -232,8 +232,13 @@ static void test_capture_reset(struct context *c, VAProfile profile, int copy)
 	struct surface stale = {.pending = 1, .ctx = c};
 	c->inflight[7] = &stale;
 	c->newest = &stale;
+	c->sps_len = 7;
+	c->pps_len[0] = 3;
+	c->pps_len[1] = 5;
+	c->pps_len[255] = 4;
 	assert(!dec_reset(c));
 	assert(!stale.pending && stale.error && !c->newest && !pending_output);
+	assert(!c->sps_len && !c->pps_len[0] && !c->pps_len[1] && !c->pps_len[255]);
 	assert(opens == 2 && closes == 1 && !c->failed && !c->cap_ready);
 	assert(!dec_submit(c, data, sizeof(data), &keyframe));
 	assert(c->cap_ready && keyframe.pending && !keyframe.error && pending_output == 1);
