@@ -14,6 +14,13 @@ git -C "$SRC" apply "$CACHE/0001-bound-ayaneo-haptics-polling.patch"
 git -C "$SRC" apply "$CACHE/0002-ayaneo-haptics-timed-rumble-and-steam-pulses.patch"
 # Manage the uhid "AYN Odin2 IMU" (qcom-sdl-pad --motion-only) as a gyro source.
 git -C "$SRC" apply "$CACHE/0003-manage-ayn-odin2-imu-uhid.patch"
+# Hide rules for hidraw sources also match the HID device, so a stale rule
+# can't hide our deck-uhid target when it reuses the number (pad dead after sleep).
+git -C "$SRC" apply "$CACHE/0004-hidraw-hide-rules-match-the-hid-device.patch"
+# Target devices stay across sleep when SUSPEND_TARGET_DEVICES_ON_SLEEP=0, so
+# Steam sees no controller disconnect on wake.
+git -C "$SRC" apply "$CACHE/0006-keep-target-devices-across-sleep.patch"
+# Proposed, not applied: 0005-stable-unit-serial.patch (stable "F" serial per device) resets everyone's controller layouts once, so it waits for a test.
 (cd "$SRC" && cargo +1.93.1 build --release --locked -j"${BUILD_JOBS:-4}")
 install -m755 "$SRC/target/release/inputplumber" "$CACHE/inputplumber-0.81.0-konkr"
 (cd "$CACHE" && sha256sum inputplumber-0.81.0-konkr > inputplumber-0.81.0-konkr.sha256)
