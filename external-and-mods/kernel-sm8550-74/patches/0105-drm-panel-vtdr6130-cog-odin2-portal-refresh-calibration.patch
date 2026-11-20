@@ -1,0 +1,732 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TheWeaklessOne <41053514+TheWeaklessOne@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 00:26:30 +0100
+Subject: [PATCH] drm/panel: vtdr6130-cog: per-unit refresh calibration for the
+ Odin 2 Portal
+
+The panel refreshes from its own oscillator, so a unit's real rate is off
+from its mode by a fixed factor: one Odin 2 Portal runs at 120.55 Hz in
+the nominal 120 Hz mode. A 119 fps stream then shows about 1.5 repeated
+refreshes a second. AYN's Android corrects this per unit
+(qcom,quec-refresh-120hz/60hz = 18/1974 in the panel node, a factory
+value in /mnt/vendor/persist/odin/fps). ROCKNIX (PR 3484) and Armada
+(PR 794) expose the two slot frame lengths as frame_len_120 and
+frame_len_60 on the DSI device, calibrate them from vblank timing and
+write the saved values at boot.
+
+Do the same for the Portal with the same two attributes, so their tools
+work unchanged:
+- frame_len_120 (10..118, default 18) and frame_len_60 (1874..2074,
+  default 1974). The modes keep their nominal timings for user space;
+  each attribute's distance from Android's default is an offset in lines
+  at that slot's nominal mode. A mode in the slot (above 60 Hz: the 120 Hz
+  slot) gets the offset scaled by its vtotal, because the error is a
+  factor on the line time: frame length = front porch +
+  round(offset * vtotal / nominal vtotal). That covers the stretched
+  gamescope modes and the switch while on.
+- A new value is sent the way a refresh switch is (patches 0102/0103):
+  a new optional drm_panel hook, resync_pending(), is asked on every
+  commit by the DPU CRTC's atomic_begin; when it is true, the encoder
+  waits for the previous frame's transfer and calls the panel's
+  switch_mode() with the running mode. If no commit comes within 100 ms
+  (the link is idle then) a delayed work sends it. A value written while
+  the panel is off goes out with the next on-command. A send that fails
+  stays pending and goes again with the next commit or after 100 ms, at
+  most three more times, and the panel is put back on page 0 even after
+  a failed write.
+- The attributes were registered for every compatible but always sent
+  the RP6's B1 table: on the Portal a write would have put the RP6's
+  slot bytes into this panel. Each panel model now has its own ranges
+  and writer; the RP6 keeps its immediate write, now under cmd_lock.
+  On both, after a failed send, writing the value the attribute shows
+  sends it again instead of being skipped as unchanged.
+
+With both attributes at their defaults and nothing written, the commands
+sent are the same as before: the frame length is max(front porch, 18) as
+in 0101, the switch sequence is unchanged, and the new per-commit check
+reads one flag.
+---
+ drivers/gpu/drm/drm_panel.c                   |  21 ++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c      |   6 +
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c   |  35 ++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h   |   2 +
+ drivers/gpu/drm/msm/dsi/dsi_manager.c         |  16 +
+ drivers/gpu/drm/msm/msm_drv.h                 |   6 +
+ .../drm/panel/panel-visionox-vtdr6130-cog.c   | 312 +++++++++++++++---
+ include/drm/drm_panel.h                       |  15 +
+ 8 files changed, 369 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_panel.c b/drivers/gpu/drm/drm_panel.c
+index bd034a8..5cf5aed 100644
+--- a/drivers/gpu/drm/drm_panel.c
++++ b/drivers/gpu/drm/drm_panel.c
+@@ -957,6 +957,27 @@ int drm_panel_switch_mode(struct drm_panel *panel,
+ }
+ EXPORT_SYMBOL(drm_panel_switch_mode);
+ 
++/**
++ * drm_panel_resync_pending - check whether an enabled panel waits to send a
++ *	change of its own between two frames
++ * @panel: DRM panel
++ *
++ * Display drivers that call drm_panel_switch_mode() ask this on every
++ * commit; if it returns true they call drm_panel_switch_mode() with the
++ * running mode, at the point in the commit where they make a mode switch.
++ *
++ * Return: true if such a change is pending.
++ */
++bool drm_panel_resync_pending(struct drm_panel *panel)
++{
++	if (!panel || !panel->enabled || !panel->funcs ||
++	    !panel->funcs->resync_pending || !panel->funcs->switch_mode)
++		return false;
++
++	return panel->funcs->resync_pending(panel);
++}
++EXPORT_SYMBOL(drm_panel_resync_pending);
++
+ /**
+  * drm_panel_get - Acquire a panel reference
+  * @panel: DRM panel
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index e966a2e..a99b840 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -940,6 +940,12 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ 			dpu_encoder_switch_mode(encoder,
+ 						&old_crtc_state->adjusted_mode,
+ 						&crtc->state->adjusted_mode);
++	} else if (crtc->state->active &&
++		   !drm_atomic_crtc_needs_modeset(crtc->state)) {
++		/* A panel change waiting for the same window (calibration) */
++		drm_for_each_encoder_mask(encoder, crtc->dev,
++					  crtc->state->encoder_mask)
++			dpu_encoder_panel_resync(encoder);
+ 	}
+ 
+ 	_dpu_crtc_check_and_setup_lm_bounds(crtc, crtc->state);
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index fa43b9e..4af9506 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -807,6 +807,41 @@ void dpu_encoder_switch_mode(struct drm_encoder *drm_enc,
+ 			      DRM_MODE_ARG(new_mode), ret);
+ }
+ 
++/**
++ * dpu_encoder_panel_resync - let a command mode panel send a change of its
++ *	own (a frame length calibration) between two frames
++ * @drm_enc: Pointer to drm encoder structure
++ *
++ * Called from the CRTC's atomic_begin of a commit without a mode change.
++ * Costs one check unless the panel has something pending; then it waits
++ * for the previous frame's transfer, like dpu_encoder_switch_mode(), and
++ * hands the panel its running mode. The timings do not change, so the
++ * tear check stays as it is.
++ */
++void dpu_encoder_panel_resync(struct drm_encoder *drm_enc)
++{
++	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
++	struct msm_drm_private *priv = drm_enc->dev->dev_private;
++	const struct msm_display_info *disp_info = &dpu_enc->disp_info;
++	struct msm_dsi *msm_dsi;
++	int ret;
++
++	if (disp_info->intf_type != INTF_DSI || !disp_info->is_cmd_mode ||
++	    disp_info->num_of_h_tiles != 1 || dpu_enc->num_phys_encs != 1 ||
++	    !dpu_enc->phys_encs[0])
++		return;
++
++	msm_dsi = priv->kms->dsi[disp_info->h_tile_instance[0]];
++	if (!msm_dsi_panel_resync_pending(msm_dsi))
++		return;
++
++	dpu_encoder_wait_for_tx_complete(drm_enc);
++
++	ret = msm_dsi_switch_mode(msm_dsi, &dpu_enc->phys_encs[0]->cached_mode);
++	if (ret)
++		DPU_ERROR_ENC(dpu_enc, "panel resync failed: %d\n", ret);
++}
++
+ bool dpu_encoder_needs_modeset(struct drm_encoder *drm_enc, struct drm_atomic_commit *state)
+ {
+ 	struct drm_connector *connector;
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+index 158cba8..c566c01 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+@@ -97,6 +97,8 @@ void dpu_encoder_switch_mode(struct drm_encoder *drm_enc,
+ 			     const struct drm_display_mode *old_mode,
+ 			     const struct drm_display_mode *new_mode);
+ 
++void dpu_encoder_panel_resync(struct drm_encoder *drm_enc);
++
+ void dpu_encoder_prepare_wb_job(struct drm_encoder *drm_enc,
+ 		struct drm_writeback_job *job);
+ 
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_manager.c b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+index 772b9e1..6247872 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_manager.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+@@ -688,3 +688,19 @@ int msm_dsi_switch_mode(struct msm_dsi *msm_dsi,
+ 
+ 	return drm_panel_switch_mode(panel, mode);
+ }
++
++/**
++ * msm_dsi_panel_resync_pending - check whether the command mode panel behind
++ *	a running link waits to send a change between two frames
++ * @msm_dsi: DSI device
++ *
++ * Return: true if msm_dsi_switch_mode() with the running mode should be
++ * called in this commit (see drm_panel_resync_pending()).
++ */
++bool msm_dsi_panel_resync_pending(struct msm_dsi *msm_dsi)
++{
++	if (!msm_dsi || IS_BONDED_DSI() || !msm_dsi_is_cmd_mode(msm_dsi))
++		return false;
++
++	return drm_panel_resync_pending(drm_panel_bridge_get_panel(msm_dsi->next_bridge));
++}
+diff --git a/drivers/gpu/drm/msm/msm_drv.h b/drivers/gpu/drm/msm/msm_drv.h
+index 0c3f2d7..d300425 100644
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -308,6 +308,7 @@ bool msm_dsi_can_switch_mode(struct msm_dsi *msm_dsi,
+ 			     const struct drm_display_mode *new_mode);
+ int msm_dsi_switch_mode(struct msm_dsi *msm_dsi,
+ 			const struct drm_display_mode *mode);
++bool msm_dsi_panel_resync_pending(struct msm_dsi *msm_dsi);
+ #else
+ static inline void __init msm_dsi_register(void)
+ {
+@@ -363,6 +364,11 @@ static inline int msm_dsi_switch_mode(struct msm_dsi *msm_dsi,
+ {
+ 	return -EINVAL;
+ }
++
++static inline bool msm_dsi_panel_resync_pending(struct msm_dsi *msm_dsi)
++{
++	return false;
++}
+ #endif
+ 
+ struct msm_dp;
+diff --git a/drivers/gpu/drm/panel/panel-visionox-vtdr6130-cog.c b/drivers/gpu/drm/panel/panel-visionox-vtdr6130-cog.c
+index 4788b13..370e2cc 100644
+--- a/drivers/gpu/drm/panel/panel-visionox-vtdr6130-cog.c
++++ b/drivers/gpu/drm/panel/panel-visionox-vtdr6130-cog.c
+@@ -12,6 +12,7 @@
+ #include <linux/of.h>
+ #include <linux/of_graph.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/workqueue.h>
+ 
+ #include <video/mipi_display.h>
+ 
+@@ -41,6 +42,32 @@ struct panel_info {
+ 
+ 	u16 frame_len_120;
+ 	u16 frame_len_60;
++
++	/*
++	 * Panels that switch modes while on (switch_mode): the mode the panel
++	 * runs, and the changes (VTDR6130_PENDING_*) waiting to be sent in the
++	 * display driver's command window, see vtdr6130_resync_pending().
++	 */
++	struct drm_display_mode cur_mode;
++	bool cur_mode_valid;
++	/* Retries left for a frame length send that failed; under cmd_lock */
++	u8 send_tries;
++	/* The last frame length send failed, maybe in part; under cmd_lock */
++	bool frame_len_dirty;
++	unsigned long pending;
++	/* Sends the pending changes when no commit comes to take them. */
++	struct delayed_work pending_work;
++};
++
++/* Bits of panel_info.pending */
++#define VTDR6130_PENDING_FRAME_LEN	0
++
++/* How a panel model takes its per-unit frame length (sysfs frame_len_120/60) */
++struct vtdr6130_frame_len {
++	u16 def_120, min_120, max_120;
++	u16 def_60, min_60, max_60;
++	/* Send the new values to the enabled panel; called with cmd_lock held */
++	int (*apply)(struct panel_info *pinfo);
+ };
+ 
+ struct panel_desc {
+@@ -70,6 +97,8 @@ struct panel_desc {
+ 	/* Built-in EDID for panels whose users (gamescope) need one. */
+ 	const u8 *edid;
+ 	size_t edid_size;
++	/* Per-unit refresh calibration; without it frame_len_* are refused */
++	const struct vtdr6130_frame_len *frame_len;
+ 
+ 	struct drm_dsc_config dsc;
+ };
+@@ -130,6 +159,25 @@ static void vtdr6130_rp6_set_frame_len(struct mipi_dsi_multi_context *dsi_ctx,
+ 	mipi_dsi_generic_write_multi(dsi_ctx, payload, sizeof(payload));
+ }
+ 
++/* ROCKNIX PR 3484: the RP6 takes a new frame length at once, in HS mode. */
++static int vtdr6130_rp6_apply_frame_len(struct panel_info *pinfo)
++{
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi };
++
++	pinfo->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++	vtdr6130_rp6_set_frame_len(&dsi_ctx, pinfo);
++	mipi_dsi_generic_write_seq_multi(&dsi_ctx, 0xF0, 0xAA, 0x00);
++	pinfo->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++
++	return dsi_ctx.accum_err;
++}
++
++static const struct vtdr6130_frame_len vtdr6130_rp6_frame_len = {
++	.def_120 = 0x1c, .min_120 = 0x10, .max_120 = 0x80,
++	.def_60 = 0x7d0, .min_60 = 0x76c, .max_60 = 0x834,
++	.apply = vtdr6130_rp6_apply_frame_len,
++};
++
+ static int vtdr6130_rp6_init_sequence(struct panel_info *pinfo)
+ {
+ 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi };
+@@ -279,6 +327,7 @@ static struct panel_desc vtdr6130_rp6_desc = {
+ 	.format = MIPI_DSI_FMT_RGB888,
+ 	.mode_flags =  MIPI_DSI_MODE_NO_EOT_PACKET | MIPI_DSI_CLOCK_NON_CONTINUOUS | MIPI_DSI_MODE_LPM,
+ 	.init_sequence = vtdr6130_rp6_init_sequence,
++	.frame_len = &vtdr6130_rp6_frame_len,
+ 	.dsc = {
+ 		.dsc_version_major = 0x1,
+ 		.dsc_version_minor = 0x1,
+@@ -304,15 +353,47 @@ static struct panel_desc vtdr6130_rp6_desc = {
+  * (offset 0x0b); rates up to 60 Hz use the latter.
+  */
+ #define VTDR6130_PORTAL_MIN_FRAME_LEN	18
++/* Lowest frame length a per-unit calibration may give (Android's is 18) */
++#define VTDR6130_PORTAL_MIN_CAL_FRAME_LEN	10
++/* Retries of a failed frame length send before it waits for the next change */
++#define VTDR6130_PORTAL_SEND_TRIES	3
+ 
+-static u16 vtdr6130_portal_mode_frame_len(const struct drm_display_mode *m,
++/*
++ * Per-unit refresh calibration. The panel runs from its own oscillator, so
++ * a unit's real rate differs from the mode's by a fixed factor (one unit:
++ * 120.55 Hz at the nominal 120 Hz mode). AYN's Android corrects it per unit
++ * (qcom,quec-refresh-120hz/60hz, defaults 18 and 1974, with a factory value
++ * from /mnt/vendor/persist/odin/fps); ROCKNIX and Armada expose the two
++ * slot lengths as frame_len_120 and frame_len_60 in sysfs and apply a saved
++ * value at boot. This panel takes the same two attributes, so their tools
++ * work unchanged, but the modes keep their nominal timings for user space:
++ * each attribute's distance from Android's default is an offset in lines at
++ * that slot's nominal mode, and a mode in that slot (rates above 60 Hz use
++ * the 120 Hz slot) gets the offset scaled by its length, because the error
++ * is a factor on the line time: frame length = front porch +
++ * round(offset * vtotal / nominal vtotal). At the defaults (offset 0) this is
++ * the front porch, as before.
++ */
++static u16 vtdr6130_portal_mode_frame_len(struct panel_info *pinfo,
++					  const struct drm_display_mode *m,
+ 					  bool *slow)
+ {
++	const struct vtdr6130_frame_len *cal = pinfo->desc->frame_len;
++	const struct drm_display_mode *nom;
++	int fl = max_t(int, m->vsync_start - m->vdisplay, VTDR6130_PORTAL_MIN_FRAME_LEN);
++	int off;
++
+ 	*slow = drm_mode_vrefresh(m) <= 60;
+-	return max_t(int, m->vsync_start - m->vdisplay, VTDR6130_PORTAL_MIN_FRAME_LEN);
++	nom = &pinfo->desc->modes[*slow ? 1 : 0];
++	off = *slow ? (int)READ_ONCE(pinfo->frame_len_60) - cal->def_60 :
++		      (int)READ_ONCE(pinfo->frame_len_120) - cal->def_120;
++	if (off)
++		fl += DIV_ROUND_CLOSEST(off * (int)m->vtotal, (int)nom->vtotal);
++
++	return clamp_t(int, fl, VTDR6130_PORTAL_MIN_CAL_FRAME_LEN, U16_MAX);
+ }
+ 
+-static u16 vtdr6130_portal_frame_len(struct panel_info *pinfo, bool *slow)
++static const struct drm_display_mode *vtdr6130_portal_mode(struct panel_info *pinfo)
+ {
+ 	const struct drm_display_mode *m = &pinfo->desc->modes[0];
+ 	struct drm_connector *connector = pinfo->connector;
+@@ -321,9 +402,64 @@ static u16 vtdr6130_portal_frame_len(struct panel_info *pinfo, bool *slow)
+ 	    connector->state->crtc->state->mode.vdisplay == m->vdisplay)
+ 		m = &connector->state->crtc->state->mode;
+ 
+-	return vtdr6130_portal_mode_frame_len(m, slow);
++	return m;
++}
++
++/* The frame length of @mode, sent in LP mode as Android does; cmd_lock held */
++static int vtdr6130_portal_send_frame_len(struct panel_info *pinfo,
++					  const struct drm_display_mode *mode)
++{
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi };
++	bool slow;
++	u16 fl;
++	int ret;
++
++	/* A change requested from now on is not in this write */
++	clear_bit(VTDR6130_PENDING_FRAME_LEN, &pinfo->pending);
++	smp_mb__after_atomic();
++	fl = vtdr6130_portal_mode_frame_len(pinfo, mode, &slow);
++
++	/* Android sends its timing switch command in LP mode, as the on-command */
++	pinfo->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++
++	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0x6c, slow ? 0x01 : 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xaa, 0x10);
++	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0x65, slow ? 0x0b : 0x04);
++	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0xb1, fl >> 8, fl & 0xff);
++	/*
++	 * Back to page 0, where the on-command leaves the panel, also after a
++	 * failed write (the multi helpers skip everything after an error).
++	 */
++	ret = dsi_ctx.accum_err;
++	dsi_ctx.accum_err = 0;
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xaa, 0x00);
++
++	return ret ?: dsi_ctx.accum_err;
+ }
+ 
++/*
++ * A new calibration value for the enabled panel: the display driver sends
++ * it in its command window after the next frame's transfer (the path of a
++ * refresh switch, drm_panel_funcs.resync_pending); pending_work sends it
++ * if no commit comes within 100 ms, when the link is idle anyway.
++ */
++static int vtdr6130_portal_apply_frame_len(struct panel_info *pinfo)
++{
++	pinfo->send_tries = VTDR6130_PORTAL_SEND_TRIES;
++	set_bit(VTDR6130_PENDING_FRAME_LEN, &pinfo->pending);
++	if (pinfo->enabled)
++		mod_delayed_work(system_dfl_wq, &pinfo->pending_work, msecs_to_jiffies(100));
++
++	return 0;
++}
++
++static const struct vtdr6130_frame_len vtdr6130_portal_frame_len = {
++	/* Android: qcom,quec-refresh-120hz = <0x12>, -60hz = <0x7b6> */
++	.def_120 = 18, .min_120 = VTDR6130_PORTAL_MIN_CAL_FRAME_LEN, .max_120 = 118,
++	.def_60 = 1974, .min_60 = 1874, .max_60 = 2074,
++	.apply = vtdr6130_portal_apply_frame_len,
++};
++
+ /*
+  * In command mode the panel scans out at its own frame length and only
+  * takes frames from the host, so a mode that differs in the vertical front
+@@ -355,36 +491,68 @@ static bool vtdr6130_portal_can_switch_mode(struct panel_info *pinfo,
+ 	       vfp >= VTDR6130_PORTAL_MIN_FRAME_LEN && vfp <= U16_MAX;
+ }
+ 
++/*
++ * A refresh switch (a new @mode), or the running @mode again when changes
++ * are pending (vtdr6130_resync_pending()); both from the display driver's
++ * command window, or from pending_work.
++ */
+ static int vtdr6130_portal_switch_mode(struct panel_info *pinfo,
+ 				       const struct drm_display_mode *mode)
+ {
+-	struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi };
+-	bool slow;
+-	u16 fl = vtdr6130_portal_mode_frame_len(mode, &slow);
++	bool change;
++	int ret = 0;
+ 
+ 	mutex_lock(&pinfo->cmd_lock);
+ 
+-	/* Android sends its timing switch command in LP mode, as the on-command */
+-	pinfo->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++	if (!pinfo->enabled) {
++		mutex_unlock(&pinfo->cmd_lock);
++		return -EINVAL;
++	}
+ 
+-	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0x6c, slow ? 0x01 : 0x00);
+-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xaa, 0x10);
+-	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0x65, slow ? 0x0b : 0x04);
+-	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0xb1, fl >> 8, fl & 0xff);
+-	/* Back to page 0, where the on-command leaves the panel */
+-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xaa, 0x00);
++	change = !pinfo->cur_mode_valid ||
++		 !drm_mode_match(&pinfo->cur_mode, mode,
++				 DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_CLOCK);
++	if (change)
++		pinfo->send_tries = VTDR6130_PORTAL_SEND_TRIES;
++	if (change || test_bit(VTDR6130_PENDING_FRAME_LEN, &pinfo->pending)) {
++		ret = vtdr6130_portal_send_frame_len(pinfo, mode);
++		pinfo->frame_len_dirty = ret != 0;
++	}
++
++	if (mode != &pinfo->cur_mode)
++		drm_mode_copy(&pinfo->cur_mode, mode);
++	pinfo->cur_mode_valid = true;
++
++	/*
++	 * The display driver runs @mode from now on either way. If the panel
++	 * did not take its frame length, keep it pending: the next commit, or
++	 * pending_work, sends it again, VTDR6130_PORTAL_SEND_TRIES times at most.
++	 */
++	if (ret && pinfo->send_tries) {
++		pinfo->send_tries--;
++		set_bit(VTDR6130_PENDING_FRAME_LEN, &pinfo->pending);
++		mod_delayed_work(system_dfl_wq, &pinfo->pending_work, msecs_to_jiffies(100));
++	}
+ 
+ 	mutex_unlock(&pinfo->cmd_lock);
+ 
+-	return dsi_ctx.accum_err;
++	return ret;
+ }
+ 
+ static int vtdr6130_portal_init_sequence(struct panel_info *pinfo)
+ {
+ 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi };
+ 	struct drm_dsc_picture_parameter_set pps;
++	const struct drm_display_mode *m = vtdr6130_portal_mode(pinfo);
+ 	bool slow;
+-	u16 fl = vtdr6130_portal_frame_len(pinfo, &slow);
++	u16 fl;
++
++	/* The on-command carries the calibration; later changes stay pending */
++	clear_bit(VTDR6130_PENDING_FRAME_LEN, &pinfo->pending);
++	smp_mb__after_atomic();
++	fl = vtdr6130_portal_mode_frame_len(pinfo, m, &slow);
++	drm_mode_copy(&pinfo->cur_mode, m);
++	pinfo->cur_mode_valid = true;
+ 
+ 	pinfo->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+ 
+@@ -514,6 +682,7 @@ static struct panel_desc vtdr6130_portal_desc = {
+ 	 * as a black screen.
+ 	 */
+ 	.bl_min = 100,
++	.frame_len = &vtdr6130_portal_frame_len,
+ 	.edid = vtdr6130_portal_edid,
+ 	.edid_size = sizeof(vtdr6130_portal_edid),
+ 	.dsc = {
+@@ -565,7 +734,12 @@ static int vtdr6130_enable(struct drm_panel *panel)
+ {
+ 	struct panel_info *pinfo = to_panel_info(panel);
+ 
++	mutex_lock(&pinfo->cmd_lock);
+ 	pinfo->enabled = true;
++	/* A change made while the panel was off and after its on-command */
++	if (READ_ONCE(pinfo->pending))
++		mod_delayed_work(system_dfl_wq, &pinfo->pending_work, msecs_to_jiffies(100));
++	mutex_unlock(&pinfo->cmd_lock);
+ 
+ 	return 0;
+ }
+@@ -575,7 +749,11 @@ static int vtdr6130_disable(struct drm_panel *panel)
+ 	struct panel_info *pinfo = to_panel_info(panel);
+ 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi };
+ 
++	/* No pending change may reach the panel once it is going off */
++	cancel_delayed_work_sync(&pinfo->pending_work);
++	mutex_lock(&pinfo->cmd_lock);
+ 	pinfo->enabled = false;
++	mutex_unlock(&pinfo->cmd_lock);
+ 
+ 	pinfo->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+ 
+@@ -602,6 +780,8 @@ static void vtdr6130_remove(struct mipi_dsi_device *dsi)
+ 	struct panel_info *pinfo = mipi_dsi_get_drvdata(dsi);
+ 	int ret;
+ 
++	cancel_delayed_work_sync(&pinfo->pending_work);
++
+ 	ret = mipi_dsi_detach(pinfo->dsi);
+ 	if (ret < 0)
+ 		dev_err(&dsi->dev, "failed to detach from DSI host: %d\n", ret);
+@@ -690,6 +870,36 @@ static int vtdr6130_switch_mode(struct drm_panel *panel,
+ 	return ret;
+ }
+ 
++/*
++ * Called by the display driver on every commit: true when a change (a new
++ * calibration value, a debug write) waits for its command window. Then it
++ * calls switch_mode() with the running mode after the previous frame's
++ * transfer, as for a refresh switch.
++ */
++static bool vtdr6130_resync_pending(struct drm_panel *panel)
++{
++	struct panel_info *pinfo = to_panel_info(panel);
++
++	return pinfo->desc->switch_mode && READ_ONCE(pinfo->pending) &&
++	       READ_ONCE(pinfo->enabled);
++}
++
++/* The pending changes, when no commit took them within 100 ms */
++static void vtdr6130_pending_work(struct work_struct *work)
++{
++	struct panel_info *pinfo = container_of(to_delayed_work(work),
++						struct panel_info, pending_work);
++	int ret;
++
++	if (!pinfo->desc->switch_mode || !READ_ONCE(pinfo->pending) ||
++	    !pinfo->cur_mode_valid)
++		return;
++
++	ret = pinfo->desc->switch_mode(pinfo, &pinfo->cur_mode);
++	if (ret < 0 && ret != -EINVAL)
++		dev_err(&pinfo->dsi->dev, "failed to send pending changes: %d\n", ret);
++}
++
+ static const struct drm_panel_funcs vtdr6130_panel_funcs = {
+ 	.disable = vtdr6130_disable,
+ 	.enable = vtdr6130_enable,
+@@ -699,6 +909,7 @@ static const struct drm_panel_funcs vtdr6130_panel_funcs = {
+ 	.get_orientation = vtdr6130_get_orientation,
+ 	.can_switch_mode = vtdr6130_can_switch_mode,
+ 	.switch_mode = vtdr6130_switch_mode,
++	.resync_pending = vtdr6130_resync_pending,
+ };
+ 
+ static int vtdr6130_bl_update_status(struct backlight_device *bl)
+@@ -764,36 +975,54 @@ static struct backlight_device *vtdr6130_create_backlight(struct mipi_dsi_device
+ 					      &vtdr6130_bl_ops, &props);
+ }
+ 
+-static ssize_t vtdr6130_rp6_frame_len_store(struct device *dev, u16 *frame_len,
+-					    u16 min, u16 max,
+-					    const char *buf, size_t count)
++/*
++ * frame_len_120 / frame_len_60 (ROCKNIX PR 3484, Armada PR 794): a unit's
++ * frame length per slot, each panel model with its own range and its own
++ * way to send it (vtdr6130_frame_len). A value written while the panel is
++ * off is kept and goes out with the next on-command.
++ */
++static ssize_t vtdr6130_frame_len_store(struct device *dev, bool is_120,
++					const char *buf, size_t count)
+ {
+ 	struct panel_info *pinfo = dev_get_drvdata(dev);
+-	struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi };
+-	u16 val;
++	const struct vtdr6130_frame_len *cal = pinfo->desc->frame_len;
++	u16 *frame_len = is_120 ? &pinfo->frame_len_120 : &pinfo->frame_len_60;
++	u16 val, old;
+ 	int ret;
+ 
++	if (!cal)
++		return -EOPNOTSUPP;
++
+ 	ret = kstrtou16(buf, 0, &val);
+ 	if (ret)
+ 		return ret;
+ 
+-	if (val < min || val > max)
++	if (is_120 ? val < cal->min_120 || val > cal->max_120 :
++		     val < cal->min_60 || val > cal->max_60)
+ 		return -EINVAL;
+ 
+-	*frame_len = val;
+-
+-	if (!pinfo->enabled)
+-		return count;
++	mutex_lock(&pinfo->cmd_lock);
+ 
+-	pinfo->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+-	vtdr6130_rp6_set_frame_len(&dsi_ctx, pinfo);
+-	mipi_dsi_generic_write_seq_multi(&dsi_ctx, 0xF0, 0xAA, 0x00);
+-	pinfo->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++	old = *frame_len;
++	WRITE_ONCE(*frame_len, val);
++	/*
++	 * Panels that switch modes while on only queue the change for the
++	 * display driver's command window, so they take it at any time. After
++	 * a failed send the panel may hold part of it (B1 written, the page 0
++	 * write not), so the same value goes out again, not skipped as unchanged.
++	 */
++	ret = 0;
++	if ((val != old || pinfo->frame_len_dirty) &&
++	    (pinfo->enabled || pinfo->desc->switch_mode)) {
++		ret = cal->apply(pinfo);
++		pinfo->frame_len_dirty = ret != 0;
++	}
++	if (ret)
++		WRITE_ONCE(*frame_len, old);
+ 
+-	if (dsi_ctx.accum_err)
+-		return dsi_ctx.accum_err;
++	mutex_unlock(&pinfo->cmd_lock);
+ 
+-	return count;
++	return ret ?: count;
+ }
+ 
+ static ssize_t frame_len_120_show(struct device *dev,
+@@ -808,10 +1037,7 @@ static ssize_t frame_len_120_store(struct device *dev,
+ 				   struct device_attribute *attr,
+ 				   const char *buf, size_t count)
+ {
+-	struct panel_info *pinfo = dev_get_drvdata(dev);
+-
+-	return vtdr6130_rp6_frame_len_store(dev, &pinfo->frame_len_120,
+-					    0x10, 0x80, buf, count);
++	return vtdr6130_frame_len_store(dev, true, buf, count);
+ }
+ static DEVICE_ATTR_RW(frame_len_120);
+ 
+@@ -827,10 +1053,7 @@ static ssize_t frame_len_60_store(struct device *dev,
+ 				  struct device_attribute *attr,
+ 				  const char *buf, size_t count)
+ {
+-	struct panel_info *pinfo = dev_get_drvdata(dev);
+-
+-	return vtdr6130_rp6_frame_len_store(dev, &pinfo->frame_len_60,
+-					    0x76C, 0x834, buf, count);
++	return vtdr6130_frame_len_store(dev, false, buf, count);
+ }
+ static DEVICE_ATTR_RW(frame_len_60);
+ 
+@@ -873,8 +1096,9 @@ static int vtdr6130_probe(struct mipi_dsi_device *dsi)
+ 	if (ret)
+ 		return ret;
+ 
+-	pinfo->frame_len_120 = 0x1C;
+-	pinfo->frame_len_60 = 0x7D0;
++	pinfo->frame_len_120 = pinfo->desc->frame_len ? pinfo->desc->frame_len->def_120 : 0x1C;
++	pinfo->frame_len_60 = pinfo->desc->frame_len ? pinfo->desc->frame_len->def_60 : 0x7D0;
++	INIT_DELAYED_WORK(&pinfo->pending_work, vtdr6130_pending_work);
+ 
+ 	ret = drm_of_get_panel_orientation(dev->of_node, &pinfo->orientation);
+ 	if (ret < 0) {
+diff --git a/include/drm/drm_panel.h b/include/drm/drm_panel.h
+index cfd2e1a..673e950 100644
+--- a/include/drm/drm_panel.h
++++ b/include/drm/drm_panel.h
+@@ -177,6 +177,20 @@ struct drm_panel_funcs {
+ 	 */
+ 	int (*switch_mode)(struct drm_panel *panel,
+ 			   const struct drm_display_mode *mode);
++
++	/**
++	 * @resync_pending:
++	 *
++	 * Tell whether the enabled panel has a change of its own (for
++	 * example a new frame length calibration) that must be sent between
++	 * two frame transfers. Display drivers that implement @switch_mode
++	 * ask on every commit and, if true, call @switch_mode with the
++	 * running mode from the same place a mode switch is made. Must be
++	 * cheap and must not sleep.
++	 *
++	 * This function is optional.
++	 */
++	bool (*resync_pending)(struct drm_panel *panel);
+ };
+ 
+ struct drm_panel_follower_funcs {
+@@ -378,6 +392,7 @@ bool drm_panel_can_switch_mode(struct drm_panel *panel,
+ 			       const struct drm_display_mode *new_mode);
+ int drm_panel_switch_mode(struct drm_panel *panel,
+ 			  const struct drm_display_mode *mode);
++bool drm_panel_resync_pending(struct drm_panel *panel);
+ 
+ #if defined(CONFIG_OF) && IS_ENABLED(CONFIG_DRM_PANEL)
+ struct drm_panel *of_drm_find_panel(const struct device_node *np);
+-- 
+2.56.0.windows.3
+

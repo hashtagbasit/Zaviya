@@ -1,0 +1,712 @@
+From: TheWeaklessOne <41053514+TheWeaklessOne@users.noreply.github.com>
+Subject: [PATCH] drm/msm/dpu: change a command mode DSI refresh rate without a modeset
+
+A command mode DSI panel scans out at its own frame length and paces the
+host with TE; the host never transmits vertical porches. A mode that only
+stretches the vertical front porch at the same pixel clock (how gamescope
+generates its 40-120 Hz modes) needs no link or DPU reconfiguration, but
+DRM sees a new mode and does a full modeset: the panel is disabled,
+unprepared, powered up and initialised again, and the screen blinks.
+
+Add two optional drm_panel hooks, can_switch_mode() and switch_mode(), and
+drm_panel_bridge_get_panel() to reach the panel behind the msm DSI bridge.
+
+The DPU CRTC skips the modeset (clears mode_changed in its atomic check)
+only when all of these hold, and does a full modeset otherwise:
+- the msm.dpu_seamless_vfp parameter is on (default; writable at runtime);
+- the CRTC is active before and after, on the same single encoder;
+- the encoder drives a command mode panel on one non-bonded DSI interface;
+- old and new adjusted modes differ in the vertical front porch only (same
+  clock, horizontal timings, vdisplay, vsync length, flags);
+- the panel's can_switch_mode() accepts the transition;
+- nothing else already requires a modeset (CTM toggle, CDM, clone mode,
+  active or connector changes).
+
+The commit then, from the CRTC's atomic_begin and after the previous frame
+reached the panel, updates the encoder's cached mode, reprograms the tear
+check for the new vtotal (the sync counter height also covers the old
+frame length, for the frame the panel may still run at it), updates the
+DSI host's mode in place and calls the panel's switch_mode(). DRM updates
+crtc->mode and the vblank timestamping constants on every commit, and the
+DPU bandwidth vote follows the new adjusted mode through the CRTC check.
+
+drm_panel_funcs grows two members at its end. Only the msm DSI path calls
+them, on the panel behind the DSI host, so panel modules built against the
+old header stay usable elsewhere but must not sit behind msm DSI.
+
+Rebased onto Linux 7.4 (port v1.5 kernel-sm8550-74): the panel bridge moved
+from drivers/gpu/drm/bridge/panel.c into drivers/gpu/drm/drm_panel.c and its
+declarations from drm_bridge.h into drm_panel.h; the panel bridge is now the
+drm_panel itself (drm_bridge_to_panel()), so drm_panel_bridge_get_panel()
+returns that.
+---
+ drivers/gpu/drm/drm_panel.c                        | 67 ++++++++++++++++++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c           | 81 ++++++++++++++++++++++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h           |  4 ++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c        | 72 +++++++++++++++++++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h        |  8 +++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h   |  4 ++
+ .../gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c   | 20 ++++--
+ drivers/gpu/drm/msm/dsi/dsi.h                      |  2 +
+ drivers/gpu/drm/msm/dsi/dsi_host.c                 | 14 ++++
+ drivers/gpu/drm/msm/dsi/dsi_manager.c              | 69 ++++++++++++++++++
+ drivers/gpu/drm/msm/msm_drv.h                      | 18 +++++
+ include/drm/drm_panel.h                            | 41 +++++++++++
+ 12 files changed, 396 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_panel.c b/drivers/gpu/drm/drm_panel.c
+index c00529bfb..bd034a8bf 100644
+--- a/drivers/gpu/drm/drm_panel.c
++++ b/drivers/gpu/drm/drm_panel.c
+@@ -475,6 +475,23 @@ struct drm_connector *drm_panel_bridge_connector(struct drm_bridge *bridge)
+ }
+ EXPORT_SYMBOL(drm_panel_bridge_connector);
+ 
++/**
++ * drm_panel_bridge_get_panel - Returns the panel a panel_bridge wraps.
++ *
++ * @bridge: The drm_bridge, or NULL.
++ *
++ * Returns: the &drm_panel behind @bridge, or NULL if @bridge is not a
++ * panel_bridge.
++ */
++struct drm_panel *drm_panel_bridge_get_panel(struct drm_bridge *bridge)
++{
++	if (!bridge || !drm_bridge_is_panel(bridge))
++		return NULL;
++
++	return drm_bridge_to_panel(bridge);
++}
++EXPORT_SYMBOL(drm_panel_bridge_get_panel);
++
+ #ifdef CONFIG_OF
+ /**
+  * devm_drm_of_get_bridge - Return next bridge in the chain
+@@ -890,6 +907,56 @@ int drm_panel_get_modes(struct drm_panel *panel,
+ }
+ EXPORT_SYMBOL(drm_panel_get_modes);
+ 
++/**
++ * drm_panel_can_switch_mode - check whether an enabled panel can change mode
++ * @panel: DRM panel
++ * @old_mode: mode the panel runs
++ * @new_mode: mode to switch to
++ *
++ * Display drivers that can themselves follow a mode change without
++ * disabling the output call this from atomic check to find out whether the
++ * panel can follow it too, through drm_panel_switch_mode().
++ *
++ * Return: true if the panel can switch from @old_mode to @new_mode while
++ * enabled, false if the transition needs a full modeset.
++ */
++bool drm_panel_can_switch_mode(struct drm_panel *panel,
++			       const struct drm_display_mode *old_mode,
++			       const struct drm_display_mode *new_mode)
++{
++	if (!panel || !panel->funcs || !panel->funcs->can_switch_mode ||
++	    !panel->funcs->switch_mode)
++		return false;
++
++	return panel->funcs->can_switch_mode(panel, old_mode, new_mode);
++}
++EXPORT_SYMBOL(drm_panel_can_switch_mode);
++
++/**
++ * drm_panel_switch_mode - switch an enabled panel to another mode
++ * @panel: DRM panel
++ * @mode: mode to switch to
++ *
++ * Only for transitions drm_panel_can_switch_mode() accepted.
++ *
++ * Return: 0 on success or a negative error code on failure.
++ */
++int drm_panel_switch_mode(struct drm_panel *panel,
++			  const struct drm_display_mode *mode)
++{
++	if (!panel)
++		return -EINVAL;
++
++	if (!panel->funcs || !panel->funcs->switch_mode)
++		return -EOPNOTSUPP;
++
++	if (!panel->enabled)
++		return -EINVAL;
++
++	return panel->funcs->switch_mode(panel, mode);
++}
++EXPORT_SYMBOL(drm_panel_switch_mode);
++
+ /**
+  * drm_panel_get - Acquire a panel reference
+  * @panel: DRM panel
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index 365009de4..e59c2e3db 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -11,6 +11,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/ktime.h>
+ #include <linux/bits.h>
++#include <linux/moduleparam.h>
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_blend.h>
+@@ -930,6 +931,17 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ 
+ 	DRM_DEBUG_ATOMIC("crtc%d\n", crtc->base.id);
+ 
++	if (cstate->switch_mode && crtc->state->active) {
++		const struct drm_crtc_state *old_crtc_state =
++			drm_atomic_get_old_crtc_state(state, crtc);
++
++		drm_for_each_encoder_mask(encoder, crtc->dev,
++					  crtc->state->encoder_mask)
++			dpu_encoder_switch_mode(encoder,
++						&old_crtc_state->adjusted_mode,
++						&crtc->state->adjusted_mode);
++	}
++
+ 	_dpu_crtc_check_and_setup_lm_bounds(crtc, crtc->state);
+ 
+ 	/* encoder will trigger pending mask now */
+@@ -1188,6 +1200,8 @@ static struct drm_crtc_state *dpu_crtc_duplicate_state(struct drm_crtc *crtc)
+ 	/* duplicate base helper */
+ 	__drm_atomic_helper_crtc_duplicate_state(crtc, &cstate->base);
+ 
++	cstate->switch_mode = false;
++
+ 	return &cstate->base;
+ }
+ 
+@@ -1514,6 +1528,44 @@ static int dpu_crtc_assign_resources(struct drm_crtc *crtc,
+ 	return 0;
+ }
+ 
++static bool dpu_seamless_vfp = true;
++MODULE_PARM_DESC(dpu_seamless_vfp,
++		 "Change the vertical front porch (refresh rate) of a command mode DSI panel without a modeset when the panel supports it (1=on (default), 0=always modeset)");
++module_param(dpu_seamless_vfp, bool, 0644);
++
++/*
++ * A mode change the CRTC can make without a modeset: the CRTC stays active
++ * on the same single encoder (no clone mode), and that encoder (and, behind
++ * it, the panel) can follow the new timings while running. In practice a
++ * vertical front porch change on a command mode DSI panel, see
++ * dpu_encoder_can_switch_mode().
++ */
++
++static bool dpu_crtc_can_switch_mode(const struct drm_crtc_state *old_crtc_state,
++				     const struct drm_crtc_state *new_crtc_state,
++				     const struct drm_display_mode *old_mode,
++				     const struct drm_display_mode *new_mode)
++{
++	struct drm_encoder *drm_enc;
++
++	if (!READ_ONCE(dpu_seamless_vfp) ||
++	    !old_crtc_state->active || !new_crtc_state->active ||
++	    new_crtc_state->active_changed ||
++	    new_crtc_state->connectors_changed ||
++	    hweight32(new_crtc_state->encoder_mask) != 1 ||
++	    old_crtc_state->encoder_mask != new_crtc_state->encoder_mask ||
++	    drm_mode_equal(old_mode, new_mode))
++		return false;
++
++	drm_for_each_encoder_mask(drm_enc, new_crtc_state->crtc->dev,
++				  new_crtc_state->encoder_mask) {
++		if (!dpu_encoder_can_switch_mode(drm_enc, old_mode, new_mode))
++			return false;
++	}
++
++	return true;
++}
++
+ /**
+  * dpu_crtc_check_mode_changed: check if full modeset is required
+  * @old_crtc_state:	Previous CRTC state
+@@ -1526,6 +1578,7 @@ int dpu_crtc_check_mode_changed(struct drm_crtc_state *old_crtc_state,
+ {
+ 	struct drm_encoder *drm_enc;
+ 	struct drm_crtc *crtc = new_crtc_state->crtc;
++	struct dpu_crtc_state *cstate = to_dpu_crtc_state(new_crtc_state);
+ 	bool clone_mode_enabled = drm_crtc_in_clone_mode(old_crtc_state);
+ 	bool clone_mode_requested = drm_crtc_in_clone_mode(new_crtc_state);
+ 
+@@ -1541,6 +1594,18 @@ int dpu_crtc_check_mode_changed(struct drm_crtc_state *old_crtc_state,
+ 	    (!clone_mode_requested && clone_mode_enabled))
+ 		new_crtc_state->mode_changed = true;
+ 
++	/*
++	 * The DRM helpers have not compared the modes yet, so mode_changed
++	 * is only set here for reasons that need a modeset whatever the mode
++	 * (CTM toggle, CDM, clone mode). Without one, a mode change that can
++	 * be done on the fly is a candidate; dpu_crtc_atomic_check() decides
++	 * once the adjusted mode is known.
++	 */
++	cstate->switch_mode = !new_crtc_state->mode_changed &&
++		dpu_crtc_can_switch_mode(old_crtc_state, new_crtc_state,
++					 &old_crtc_state->mode,
++					 &new_crtc_state->mode);
++
+ 	return 0;
+ }
+ 
+@@ -1559,6 +1624,22 @@ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
+ 
+ 	bool needs_dirtyfb = dpu_crtc_needs_dirtyfb(crtc_state);
+ 
++	if (cstate->switch_mode) {
++		const struct drm_crtc_state *old_crtc_state =
++			drm_atomic_get_old_crtc_state(state, crtc);
++
++		cstate->switch_mode = crtc_state->mode_changed &&
++			dpu_crtc_can_switch_mode(old_crtc_state, crtc_state,
++						 &old_crtc_state->adjusted_mode,
++						 &crtc_state->adjusted_mode);
++		if (cstate->switch_mode) {
++			DRM_DEBUG_ATOMIC("crtc%d: " DRM_MODE_FMT " without a modeset\n",
++					 crtc->base.id,
++					 DRM_MODE_ARG(&crtc_state->adjusted_mode));
++			crtc_state->mode_changed = false;
++		}
++	}
++
+ 	/* don't reallocate resources if only ACTIVE has beeen changed */
+ 	if (crtc_state->mode_changed || crtc_state->connectors_changed ||
+ 	    crtc_state->color_mgmt_changed) {
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+index 5eac9948a..95fb02c3a 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+@@ -204,6 +204,8 @@ struct dpu_crtc {
+  * @hw_ctls       : List of active ctl paths
+  * @crc_source    : CRC source
+  * @crc_frame_skip_count: Number of frames skipped before getting CRC
++ * @switch_mode   : the mode changes without a modeset: the encoders and the
++ *                  panel follow it on the fly (see dpu_crtc_can_switch_mode())
+  */
+ struct dpu_crtc_state {
+ 	struct drm_crtc_state base;
+@@ -225,6 +227,8 @@ struct dpu_crtc_state {
+ 
+ 	enum dpu_crtc_crc_source crc_source;
+ 	int crc_frame_skip_count;
++
++	bool switch_mode;
+ };
+ 
+ #define to_dpu_crtc_state(x) \
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index c8d627b4d..fa43b9ef0 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -735,6 +735,78 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
+ 	}
+ }
+ 
++/**
++ * dpu_encoder_can_switch_mode - check whether the running encoder can follow
++ *	a mode change without a modeset
++ * @drm_enc: Pointer to drm encoder structure
++ * @old_mode: adjusted mode the encoder runs
++ * @new_mode: adjusted mode to switch to
++ *
++ * Only a command mode panel on a single DSI interface qualifies: it scans
++ * out at its own frame length and paces the encoder through TE, so the
++ * encoder only has to adapt its tear check to the new vtotal (see
++ * dpu_encoder_switch_mode()). The DSI side accepts a vertical front porch
++ * change at the same pixel clock only, and only if the panel can switch
++ * its frame length while enabled; the layer mixer topology, which depends
++ * on the width and clock, is unchanged by such a switch.
++ *
++ * Return: true if dpu_encoder_switch_mode() can do the switch.
++ */
++bool dpu_encoder_can_switch_mode(struct drm_encoder *drm_enc,
++				 const struct drm_display_mode *old_mode,
++				 const struct drm_display_mode *new_mode)
++{
++	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
++	struct msm_drm_private *priv = drm_enc->dev->dev_private;
++	const struct msm_display_info *disp_info = &dpu_enc->disp_info;
++
++	if (disp_info->intf_type != INTF_DSI || !disp_info->is_cmd_mode ||
++	    disp_info->num_of_h_tiles != 1 || dpu_enc->num_phys_encs != 1)
++		return false;
++
++	return msm_dsi_can_switch_mode(priv->kms->dsi[disp_info->h_tile_instance[0]],
++				       old_mode, new_mode);
++}
++
++/**
++ * dpu_encoder_switch_mode - follow a mode change accepted by
++ *	dpu_encoder_can_switch_mode()
++ * @drm_enc: Pointer to drm encoder structure
++ * @old_mode: adjusted mode the encoder runs
++ * @new_mode: adjusted mode to switch to
++ *
++ * Called from the CRTC's atomic_begin, before the first frame of @new_mode
++ * is flushed.
++ */
++void dpu_encoder_switch_mode(struct drm_encoder *drm_enc,
++			     const struct drm_display_mode *old_mode,
++			     const struct drm_display_mode *new_mode)
++{
++	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
++	struct msm_drm_private *priv = drm_enc->dev->dev_private;
++	const struct msm_display_info *disp_info = &dpu_enc->disp_info;
++	int i, ret;
++
++	DPU_DEBUG_ENC(dpu_enc, DRM_MODE_FMT "\n", DRM_MODE_ARG(new_mode));
++
++	/* Let the last frame reach the panel before touching the TE setup */
++	dpu_encoder_wait_for_tx_complete(drm_enc);
++
++	for (i = 0; i < dpu_enc->num_phys_encs; i++) {
++		struct dpu_encoder_phys *phys = dpu_enc->phys_encs[i];
++
++		phys->cached_mode = *new_mode;
++		if (phys->ops.switch_mode)
++			phys->ops.switch_mode(phys, old_mode);
++	}
++
++	ret = msm_dsi_switch_mode(priv->kms->dsi[disp_info->h_tile_instance[0]],
++				  new_mode);
++	if (ret)
++		DPU_ERROR_ENC(dpu_enc, "panel did not switch to " DRM_MODE_FMT ": %d\n",
++			      DRM_MODE_ARG(new_mode), ret);
++}
++
+ bool dpu_encoder_needs_modeset(struct drm_encoder *drm_enc, struct drm_atomic_commit *state)
+ {
+ 	struct drm_connector *connector;
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+index 4942097e7..158cba879 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+@@ -89,6 +89,14 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
+ 
+ bool dpu_encoder_needs_modeset(struct drm_encoder *drm_enc, struct drm_atomic_commit *state);
+ 
++bool dpu_encoder_can_switch_mode(struct drm_encoder *drm_enc,
++				 const struct drm_display_mode *old_mode,
++				 const struct drm_display_mode *new_mode);
++
++void dpu_encoder_switch_mode(struct drm_encoder *drm_enc,
++			     const struct drm_display_mode *old_mode,
++			     const struct drm_display_mode *new_mode);
++
+ void dpu_encoder_prepare_wb_job(struct drm_encoder *drm_enc,
+ 		struct drm_writeback_job *job);
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
+index 10fd1431d..42ed22545 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
+@@ -71,6 +71,8 @@ struct dpu_encoder_phys;
+  *				on split_role and current mode (CMD/VID).
+  * @atomic_mode_set:		DRM Call. Set a DRM mode.
+  *				This likely caches the mode, for use at enable.
++ * @switch_mode:		Follow a change of the cached mode, from the
++ *				given previous mode, without a modeset.
+  * @enable:			DRM Call. Enable a DRM mode.
+  * @disable:			DRM Call. Disable mode.
+  * @control_vblank_irq		Register/Deregister for VBLANK IRQ
+@@ -98,6 +100,8 @@ struct dpu_encoder_phys_ops {
+ 	void (*atomic_mode_set)(struct dpu_encoder_phys *encoder,
+ 			struct drm_crtc_state *crtc_state,
+ 			struct drm_connector_state *conn_state);
++	void (*switch_mode)(struct dpu_encoder_phys *encoder,
++			    const struct drm_display_mode *old_mode);
+ 	void (*enable)(struct dpu_encoder_phys *encoder);
+ 	void (*disable)(struct dpu_encoder_phys *encoder);
+ 	int (*control_vblank_irq)(struct dpu_encoder_phys *enc, bool enable);
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+index f5e0c4157..a1334c726 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+@@ -340,7 +340,7 @@ static void dpu_encoder_phys_cmd_irq_disable(struct dpu_encoder_phys *phys_enc)
+ }
+ 
+ static void dpu_encoder_phys_cmd_tearcheck_config(
+-		struct dpu_encoder_phys *phys_enc)
++		struct dpu_encoder_phys *phys_enc, u32 prev_vtotal)
+ {
+ 	struct dpu_encoder_phys_cmd *cmd_enc =
+ 		to_dpu_encoder_phys_cmd(phys_enc);
+@@ -389,10 +389,13 @@ static void dpu_encoder_phys_cmd_tearcheck_config(
+ 
+ 	/*
+ 	 * Set the sync_cfg_height to twice vtotal so that if we lose a
+-	 * TE event coming from the display TE pin we won't stall immediately
++	 * TE event coming from the display TE pin we won't stall immediately.
++	 * Across a mode switch without a modeset the panel may still send TE
++	 * at the previous frame length (prev_vtotal) for a frame: keep the
++	 * counter from wrapping before that TE either.
+ 	 */
+ 	tc_cfg.hw_vsync_mode = 1;
+-	tc_cfg.sync_cfg_height = mode->vtotal * 2;
++	tc_cfg.sync_cfg_height = max_t(u32, mode->vtotal, prev_vtotal) * 2;
+ 	tc_cfg.vsync_init_val = mode->vdisplay;
+ 	tc_cfg.sync_threshold_start = DEFAULT_TEARCHECK_SYNC_THRESH_START;
+ 	tc_cfg.sync_threshold_continue = DEFAULT_TEARCHECK_SYNC_THRESH_CONTINUE;
+@@ -436,7 +439,15 @@ static void _dpu_encoder_phys_cmd_pingpong_config(
+ 	drm_mode_debug_printmodeline(&phys_enc->cached_mode);
+ 
+ 	_dpu_encoder_phys_cmd_update_intf_cfg(phys_enc);
+-	dpu_encoder_phys_cmd_tearcheck_config(phys_enc);
++	dpu_encoder_phys_cmd_tearcheck_config(phys_enc, 0);
++}
++
++static void dpu_encoder_phys_cmd_switch_mode(
++		struct dpu_encoder_phys *phys_enc,
++		const struct drm_display_mode *old_mode)
++{
++	/* cached_mode already holds the new mode */
++	dpu_encoder_phys_cmd_tearcheck_config(phys_enc, old_mode->vtotal);
+ }
+ 
+ static bool dpu_encoder_phys_cmd_needs_single_flush(
+@@ -708,6 +719,7 @@ static void dpu_encoder_phys_cmd_init_ops(
+ {
+ 	ops->is_master = dpu_encoder_phys_cmd_is_master;
+ 	ops->atomic_mode_set = dpu_encoder_phys_cmd_atomic_mode_set;
++	ops->switch_mode = dpu_encoder_phys_cmd_switch_mode;
+ 	ops->enable = dpu_encoder_phys_cmd_enable;
+ 	ops->disable = dpu_encoder_phys_cmd_disable;
+ 	ops->control_vblank_irq = dpu_encoder_phys_cmd_control_vblank_irq;
+diff --git a/drivers/gpu/drm/msm/dsi/dsi.h b/drivers/gpu/drm/msm/dsi/dsi.h
+index 93c028a12..2492cc16a 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi.h
++++ b/drivers/gpu/drm/msm/dsi/dsi.h
+@@ -78,6 +78,8 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
+ int msm_dsi_host_power_off(struct mipi_dsi_host *host);
+ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
+ 				  const struct drm_display_mode *mode);
++void msm_dsi_host_update_display_mode(struct mipi_dsi_host *host,
++				      const struct drm_display_mode *mode);
+ enum drm_mode_status msm_dsi_host_check_dsc(struct mipi_dsi_host *host,
+ 					    const struct drm_display_mode *mode);
+ unsigned long msm_dsi_host_get_mode_flags(struct mipi_dsi_host *host);
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
+index d92659d80..71e00af82 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -2601,6 +2601,20 @@ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
+ 	return 0;
+ }
+ 
++/*
++ * Change the mode of a running host in place, for msm_dsi_switch_mode():
++ * unlike msm_dsi_host_set_display_mode() this never frees msm_host->mode,
++ * which a concurrent command transfer may be reading (hdisplay, unchanged).
++ */
++void msm_dsi_host_update_display_mode(struct mipi_dsi_host *host,
++				      const struct drm_display_mode *mode)
++{
++	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
++
++	if (msm_host->mode)
++		drm_mode_copy(msm_host->mode, mode);
++}
++
+ enum drm_mode_status msm_dsi_host_check_dsc(struct mipi_dsi_host *host,
+ 					    const struct drm_display_mode *mode)
+ {
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_manager.c b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+index 531d4ff78..772b9e1a6 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_manager.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "drm/drm_bridge_connector.h"
++#include <drm/drm_panel.h>
+ 
+ #include "msm_kms.h"
+ #include "dsi.h"
+@@ -619,3 +620,71 @@ const char *msm_dsi_get_te_source(struct msm_dsi *msm_dsi)
+ {
+ 	return msm_dsi->te_source;
+ }
++
++static bool dsi_mgr_mode_vfp_change_only(const struct drm_display_mode *a,
++					 const struct drm_display_mode *b)
++{
++	int dv = b->vsync_start - a->vsync_start;
++
++	return a->clock == b->clock &&
++	       a->hdisplay == b->hdisplay &&
++	       a->hsync_start == b->hsync_start &&
++	       a->hsync_end == b->hsync_end &&
++	       a->htotal == b->htotal &&
++	       a->hskew == b->hskew &&
++	       a->vdisplay == b->vdisplay &&
++	       b->vsync_end - a->vsync_end == dv &&
++	       b->vtotal - a->vtotal == dv &&
++	       a->vscan == b->vscan &&
++	       a->flags == b->flags;
++}
++
++/**
++ * msm_dsi_can_switch_mode - check whether a running link can change mode
++ * @msm_dsi: DSI device
++ * @old_mode: adjusted mode the link runs
++ * @new_mode: adjusted mode to switch to
++ *
++ * A command mode host sends each frame as a memory write paced by the
++ * panel's TE and never transmits vertical porches: the panel scans out at
++ * its own frame length. A change of the vertical front porch alone, at the
++ * same pixel clock, leaves the link (clocks, timing registers, DSC) as it
++ * is and only needs the panel to change its frame length, if it can.
++ *
++ * Return: true if msm_dsi_switch_mode() can do the switch without a
++ * modeset.
++ */
++bool msm_dsi_can_switch_mode(struct msm_dsi *msm_dsi,
++			     const struct drm_display_mode *old_mode,
++			     const struct drm_display_mode *new_mode)
++{
++	struct drm_panel *panel;
++
++	if (!msm_dsi || IS_BONDED_DSI() || !msm_dsi_is_cmd_mode(msm_dsi))
++		return false;
++
++	if (!dsi_mgr_mode_vfp_change_only(old_mode, new_mode))
++		return false;
++
++	panel = drm_panel_bridge_get_panel(msm_dsi->next_bridge);
++
++	return drm_panel_can_switch_mode(panel, old_mode, new_mode);
++}
++
++/**
++ * msm_dsi_switch_mode - switch a running link to a mode accepted by
++ *	msm_dsi_can_switch_mode()
++ * @msm_dsi: DSI device
++ * @mode: adjusted mode to switch to
++ *
++ * Return: 0 on success, or the panel's error code.
++ */
++int msm_dsi_switch_mode(struct msm_dsi *msm_dsi,
++			const struct drm_display_mode *mode)
++{
++	struct drm_panel *panel = drm_panel_bridge_get_panel(msm_dsi->next_bridge);
++
++	msm_dsi_host_update_display_mode(msm_dsi->host, mode);
++
++	return drm_panel_switch_mode(panel, mode);
++}
+diff --git a/drivers/gpu/drm/msm/msm_drv.h b/drivers/gpu/drm/msm/msm_drv.h
+index 2840e8a50..0c3f2d7f4 100644
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -303,6 +303,11 @@ bool msm_dsi_is_master_dsi(struct msm_dsi *msm_dsi);
+ bool msm_dsi_wide_bus_enabled(struct msm_dsi *msm_dsi);
+ struct drm_dsc_config *msm_dsi_get_dsc_config(struct msm_dsi *msm_dsi);
+ const char *msm_dsi_get_te_source(struct msm_dsi *msm_dsi);
++bool msm_dsi_can_switch_mode(struct msm_dsi *msm_dsi,
++			     const struct drm_display_mode *old_mode,
++			     const struct drm_display_mode *new_mode);
++int msm_dsi_switch_mode(struct msm_dsi *msm_dsi,
++			const struct drm_display_mode *mode);
+ #else
+ static inline void __init msm_dsi_register(void)
+ {
+@@ -345,6 +350,19 @@ static inline const char *msm_dsi_get_te_source(struct msm_dsi *msm_dsi)
+ {
+ 	return NULL;
+ }
++
++static inline bool msm_dsi_can_switch_mode(struct msm_dsi *msm_dsi,
++					   const struct drm_display_mode *old_mode,
++					   const struct drm_display_mode *new_mode)
++{
++	return false;
++}
++
++static inline int msm_dsi_switch_mode(struct msm_dsi *msm_dsi,
++				      const struct drm_display_mode *mode)
++{
++	return -EINVAL;
++}
+ #endif
+ 
+ struct msm_dp;
+diff --git a/include/drm/drm_panel.h b/include/drm/drm_panel.h
+index 58113ea7d..cfd2e1ada 100644
+--- a/include/drm/drm_panel.h
++++ b/include/drm/drm_panel.h
+@@ -38,6 +38,7 @@ struct device_node;
+ struct drm_bridge;
+ struct drm_connector;
+ struct drm_device;
++struct drm_display_mode;
+ struct drm_panel_follower;
+ struct drm_panel;
+ struct display_timing;
+@@ -148,6 +149,34 @@ struct drm_panel_funcs {
+ 	 * Allows panels to create panels-specific debugfs files.
+ 	 */
+ 	void (*debugfs_init)(struct drm_panel *panel, struct dentry *root);
++
++	/**
++	 * @can_switch_mode:
++	 *
++	 * Tell whether the panel, while enabled and running @old_mode, can
++	 * be switched to @new_mode by @switch_mode, without being disabled
++	 * and unprepared. Called from atomic check, so it must not touch
++	 * the hardware. Display drivers only ask for transitions that they
++	 * can follow themselves without a full modeset.
++	 *
++	 * This function is optional; without it every mode change is a full
++	 * modeset.
++	 */
++	bool (*can_switch_mode)(struct drm_panel *panel,
++				const struct drm_display_mode *old_mode,
++				const struct drm_display_mode *new_mode);
++
++	/**
++	 * @switch_mode:
++	 *
++	 * Switch the enabled panel to @mode, a transition @can_switch_mode
++	 * accepted. Called from the display driver's commit, before the
++	 * first frame of the new mode is sent.
++	 *
++	 * This function is required if @can_switch_mode is set.
++	 */
++	int (*switch_mode)(struct drm_panel *panel,
++			   const struct drm_display_mode *mode);
+ };
+ 
+ struct drm_panel_follower_funcs {
+@@ -344,6 +373,12 @@ void drm_panel_disable(struct drm_panel *panel);
+ 
+ int drm_panel_get_modes(struct drm_panel *panel, struct drm_connector *connector);
+ 
++bool drm_panel_can_switch_mode(struct drm_panel *panel,
++			       const struct drm_display_mode *old_mode,
++			       const struct drm_display_mode *new_mode);
++int drm_panel_switch_mode(struct drm_panel *panel,
++			  const struct drm_display_mode *mode);
++
+ #if defined(CONFIG_OF) && IS_ENABLED(CONFIG_DRM_PANEL)
+ struct drm_panel *of_drm_find_panel(const struct device_node *np);
+ int drm_of_find_panel_or_bridge(const struct device_node *np,
+@@ -418,12 +453,18 @@ struct drm_bridge *devm_drm_panel_bridge_add_typed(struct device *dev,
+ struct drm_bridge *drmm_panel_bridge_add(struct drm_device *drm,
+ 					 struct drm_panel *panel);
+ struct drm_connector *drm_panel_bridge_connector(struct drm_bridge *bridge);
++struct drm_panel *drm_panel_bridge_get_panel(struct drm_bridge *bridge);
+ #else
+ static inline bool drm_bridge_is_panel(const struct drm_bridge *bridge)
+ {
+ 	return false;
+ }
+ 
++static inline struct drm_panel *drm_panel_bridge_get_panel(struct drm_bridge *bridge)
++{
++	return NULL;
++}
++
+ static inline int drm_panel_bridge_set_orientation(struct drm_connector *connector,
+ 						   struct drm_bridge *bridge)
+ {
