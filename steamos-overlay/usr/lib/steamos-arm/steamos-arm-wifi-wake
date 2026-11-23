@@ -30,14 +30,34 @@ wifi_wait() {  # wifi_wait <seconds>: true once connected
   return 1
 }
 
+# The SSID in wifi-last is as "iw dev wlan0 link" prints it: every byte that
+# is not printable ASCII, every backslash, and a space at either end become
+# \xNN, so a snail emoji is "\xf0\x9f\x90\x8c". The scan has to ask for the real bytes,
+# or no access point answers it.
+ssid_unescape() {  # ssid_unescape <var> <escaped>: the raw SSID into <var>
+  local s=$2 out= c
+  while [[ $s =~ ^([^\\]*)\\x([0-9a-fA-F]{2})(.*)$ ]]; do
+    printf -v c "\\x${BASH_REMATCH[2]}"
+    out+=${BASH_REMATCH[1]}$c
+    s=${BASH_REMATCH[3]}
+  done
+  printf -v "$1" '%s' "$out$s"
+}
+
 fast_scan() {
   local freq ssid i
   { read -r freq; read -r ssid; } <"$WIFI_LAST" 2>/dev/null || return 0
   [[ $freq =~ ^[0-9]+$ && -n $ssid ]] || return 0
+  # A NUL cannot go into an argument: probe any network on the channel.
+  if [[ $ssid == *'\x00'* ]]; then
+    ssid=
+  else
+    ssid_unescape ssid "$ssid"
+  fi
   # wlan0 comes back a moment after the resume; NetworkManager's own first
   # scan may already be running (EBUSY), so try for a few seconds.
   for ((i = 0; i < 20; i++)); do
-    iw dev wlan0 scan trigger freq "$freq" ssid "$ssid" >/dev/null 2>&1 && {
+    iw dev wlan0 scan trigger freq "$freq" ${ssid:+ssid "$ssid"} >/dev/null 2>&1 && {
       log "scanning $freq MHz for the last network"
       return 0
     }
