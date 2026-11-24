@@ -1,0 +1,79 @@
+From: Daniil Teterin <theweaklessone@gmail.com>
+Subject: [PATCH] power: supply: qcom_battmgr: sm8550: report discharging while the battery drains
+
+The SM8550-family firmware reports CHARGING whenever a source is
+attached. A port that cannot carry the load (a PC's 5 V port: about
+1.7 W in against 7 W used) leaves the battery draining while sysfs,
+UPower, MangoHud and Steam all say "Charging".
+
+When the firmware says CHARGING and the battery current is clearly
+negative, report DISCHARGING, as bq27xxx and sbs-battery derive the state
+from the current's sign. The instantaneous current on this gauge swings a
+lot, so use a hysteresis: drain is entered below -100 mA and left only
+above -30 mA. Only CHARGING is ever rewritten: FULL, NOT_CHARGING and
+DISCHARGING from the firmware pass through unchanged, and so does
+CHARGING at 99 % and up, where on a wall charger load peaks draw briefly
+from the battery through the bypass. Limited to the SM8550 variant.
+
+The current is read fresh for the decision, which costs four extra GLINK
+requests per status read, and only while the firmware says CHARGING.
+
+Signed-off-by: Daniil Teterin <theweaklessone@gmail.com>
+---
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 64b1566..933480d 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -326,6 +326,8 @@ struct qcom_battmgr {
+ 	struct completion ack;
+ 
+ 	bool service_up;
++	/* sm8550: the battery drains although the firmware says charging */
++	bool draining;
+ 
+ 	struct qcom_battmgr_info info;
+ 	struct qcom_battmgr_status status;
+@@ -518,6 +520,34 @@ out_unlock:
+ 	return ret;
+ }
+ 
++/* Hysteresis (uA) for the drain state below: enter under ON, leave over OFF. */
++#define QCOM_BATTMGR_DRAIN_ON_UA	(-100000)
++#define QCOM_BATTMGR_DRAIN_OFF_UA	(-30000)
++
++/*
++ * The SM8550 firmware reports CHARGING whenever a source is attached, also
++ * when the source cannot carry the load and the battery drains. Say
++ * DISCHARGING then. Never touches FULL, NOT_CHARGING or DISCHARGING, and
++ * not at 99 % and up: on a charger at full the firmware says CHARGING and
++ * load peaks draw briefly from the battery (the bypass), which is not drain.
++ */
++static int qcom_battmgr_sm8550_status(struct qcom_battmgr *battmgr, int status)
++{
++	if (battmgr->variant != QCOM_BATTMGR_SM8550 ||
++	    status != POWER_SUPPLY_STATUS_CHARGING ||
++	    battmgr->status.percent >= 99) {
++		battmgr->draining = false;
++		return status;
++	}
++	if (qcom_battmgr_bat_sm8350_update(battmgr, POWER_SUPPLY_PROP_CURRENT_NOW) < 0)
++		return status;
++	if (battmgr->status.current_now < QCOM_BATTMGR_DRAIN_ON_UA)
++		battmgr->draining = true;
++	else if (battmgr->status.current_now > QCOM_BATTMGR_DRAIN_OFF_UA)
++		battmgr->draining = false;
++	return battmgr->draining ? POWER_SUPPLY_STATUS_DISCHARGING : status;
++}
++
+ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
+ 					 enum power_supply_property psp,
+ 					 union power_supply_propval *val)
+@@ -539,7 +569,7 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
+ 
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
+-		val->intval = battmgr->status.status;
++		val->intval = qcom_battmgr_sm8550_status(battmgr, battmgr->status.status);
+ 		break;
+ 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
+ 		val->intval = battmgr->info.charge_type;
