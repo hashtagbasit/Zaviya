@@ -5,6 +5,7 @@ zaviya-install-start, seed-installer-shortcut). Run:
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -362,6 +363,61 @@ class StartHelper(unittest.TestCase):
                            capture_output=True, text=True, env=env)
         self.assertIn(str(UFS / "install-to-internal.sh"), r.stdout)
         self.assertNotIn("/tmp/evil", r.stdout)
+
+
+@unittest.skipUnless(shutil.which("bash"), "bash needed")
+class BatteryCheck(unittest.TestCase):
+    S = UFS / "install-to-internal.sh"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def add_supply(self, name, **props):
+        d = self.tmp / name
+        d.mkdir(parents=True, exist_ok=True)
+        for k, v in props.items():
+            (d / k).write_text(f"{v}\n", encoding="utf-8")
+
+    def check(self):
+        text = self.S.read_text(encoding="utf-8")
+        die_m = re.search(r"^die\(\)\s*\{[^\n]+\}", text, re.M)
+        fn_m = re.search(r"^battery_check\(\)\s*\{.*?^\}", text, re.S | re.M)
+        self.assertIsNotNone(die_m)
+        self.assertIsNotNone(fn_m)
+        env = {k: v for k, v in os.environ.items() if k != "ZAVIYA_SKIP_BATTERY_CHECK"}
+        env["POWER_SUPPLY_DIR"] = self.tmp.as_posix()
+        script = f"set -euo pipefail\n{die_m.group(0)}\n{fn_m.group(0)}\nbattery_check\n"
+        return subprocess.run(["bash", "-c", script],
+                              capture_output=True, text=True, env=env)
+
+    def test_ignores_controller_device_battery(self):
+        # InputPlumber's DualSense target (e.g. on AYN Thor) exposes a virtual
+        # ps-controller-battery-* node at 15% Discharging with scope=Device.
+        self.add_supply("battery", type="Battery", status="Charging", capacity=97)
+        self.add_supply("ps-controller-battery-0",
+                        type="Battery", scope="Device", status="Discharging", capacity=15)
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_rejects_low_discharging_system_battery(self):
+        self.add_supply("battery", type="Battery", status="Discharging", capacity=15)
+        r = self.check()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("15%", r.stderr)
+
+    def test_rejects_low_discharging_explicit_system_scope(self):
+        self.add_supply("battery", type="Battery", scope="System", status="Discharging", capacity=15)
+        r = self.check()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("15%", r.stderr)
+
+    def test_allows_low_charging_system_battery(self):
+        self.add_supply("battery", type="Battery", status="Charging", capacity=15)
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 class Seeder(unittest.TestCase):

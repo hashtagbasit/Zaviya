@@ -64,6 +64,7 @@ battery_check() {
   [[ -n "${ZAVIYA_SKIP_BATTERY_CHECK:-}" ]] && return 0
   for b in "${POWER_SUPPLY_DIR:-/sys/class/power_supply}"/*; do
     [[ "$(cat "$b/type" 2>/dev/null)" == Battery ]] || continue
+    [[ "$(cat "$b/scope" 2>/dev/null)" != Device ]] || continue
     cap="$(cat "$b/capacity" 2>/dev/null)"; st="$(cat "$b/status" 2>/dev/null)"
     [[ "$cap" =~ ^[0-9]+$ ]] || continue
     if (( cap < 30 )) && [[ "$st" != Charging && "$st" != Full ]]; then
