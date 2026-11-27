@@ -1,0 +1,27 @@
+From: Noahcdls <noahcdls@gmail.com>
+Subject: [PATCH] pinctrl: qcom: sm8550-lpass-lpi: force runtime suspend across system sleep
+
+The LPI pin controller only has runtime PM ops and holds the ADSP votes
+LPASS_HW_MACRO and LPASS_HW_DCODEC as PM clocks. It is a supplier of the
+SoundWire controllers, so when one of them is still runtime-active at
+system suspend the pin controller keeps both votes for the whole sleep and
+the SoC does not reach CX collapse or AOSS sleep. Force the runtime
+suspend across system sleep, like the macros and the SoundWire controller.
+
+SM8550 copy of Armada 0565 (armada-os/armada 98e87a101559, SM8650 only
+there), the same line as kernel-tb321fu 0021. Qualcomm posted the SM8650
+version to linux-arm-msm on 2026-11-12
+(20261112-lpass-lpi-system-sleep-v1-1-438cb997e0e9@oss.qualcomm.com).
+---
+diff --git a/drivers/pinctrl/qcom/pinctrl-sm8550-lpass-lpi.c b/drivers/pinctrl/qcom/pinctrl-sm8550-lpass-lpi.c
+index 875e04e..4c565b9 100644
+--- a/drivers/pinctrl/qcom/pinctrl-sm8550-lpass-lpi.c
++++ b/drivers/pinctrl/qcom/pinctrl-sm8550-lpass-lpi.c
+@@ -213,6 +213,7 @@ static const struct of_device_id lpi_pinctrl_of_match[] = {
+ MODULE_DEVICE_TABLE(of, lpi_pinctrl_of_match);
+ 
+ static const struct dev_pm_ops lpi_pinctrl_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+ 	RUNTIME_PM_OPS(pm_clk_suspend, pm_clk_resume, NULL)
+ };
+ 

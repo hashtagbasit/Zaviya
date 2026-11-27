@@ -55,3 +55,24 @@
 			"DMIC3", "MIC BIAS3",
 			"TX SWR_INPUT7", "DMIC3_OUTPUT";
 };
+
+/*
+ * SoC deep sleep. With the PCIe GDSCs powering off in s2idle (0106), the
+ * PCIe memory floor of 0019 is no longer needed for a clean wake, and it is
+ * what keeps DDR out of self-refresh and CX up while the Portal sleeps:
+ * drop it here, so pcie-qcom votes 0/0 on the memory path in s2idle as
+ * mainline does.
+ *
+ * The crypto engine has no driver on 7.4 (CRYPTO_DEV_QCE depends on BROKEN
+ * since 7.3), and the unbound node holds the sync_state of aggre2_noc and
+ * mc_virt, so the DDR path keeps its boot-time votes until the cmdline's
+ * fw_devlink.sync_state=timeout forces the sync. Disable it, as
+ * ROCKNIX/distribution PR 3636 does for the AYN boards (Jacob Cook).
+ */
+&pcie0_opp_table {
+	/delete-node/ opp-suspend-1;
+};
+
+&crypto {
+	status = "disabled";
+};

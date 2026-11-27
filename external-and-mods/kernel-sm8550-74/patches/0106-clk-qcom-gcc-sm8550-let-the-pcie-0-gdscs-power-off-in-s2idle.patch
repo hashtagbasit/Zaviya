@@ -1,0 +1,47 @@
+From: virtudude <virtudude@protonmail.com>
+Subject: [PATCH] clk: qcom: gcc-sm8550: let the PCIe 0 GDSCs power off in s2idle
+
+Mainline keeps the SM8550 PCIe GDSCs in retention when they are disabled
+(967e011013ed, PWRSTS_RET_ON), so gdsc_disable() returns without touching
+the hardware and the controllers and PHYs stay powered through s2idle. A
+powered controller still needs its NoC path, which is why the sleep set
+needs a PCIe memory vote (0018/0019 here) or the wake hard resets, and that
+vote keeps DDR out of self-refresh and CX up for the whole sleep.
+
+pcie-qcom now turns the link off whenever D3cold is possible and retrains
+it on resume, so the GDSCs can collapse; Qualcomm's downstream pci-msm also
+disables the PCIe GDSCs in its clock deinit. Let the PCIe 0 pair power off.
+PCIe 1 stays in retention: on the AYANEO Pockets it carries the USB
+controller the gamepad sits behind, and that path was not tested here.
+
+On its own this changes nothing while the suspend OPP floor of 0019 is in
+the device tree: the floor still holds DDR. A board that drops the floor
+(the Odin 2 Portal append) then reaches AOSS, CX and DDR collapse, and its
+wakes do not reset.
+
+The pcie_0 half of Armada 0566 (armada-os/armada 8dc0be9ad27c), the same
+form as ROCKNIX/distribution PR 3636 (Jacob Cook; Retroid Pocket Nova,
+AYN Thor).
+---
+diff --git a/drivers/clk/qcom/gcc-sm8550.c b/drivers/clk/qcom/gcc-sm8550.c
+index 80a44ff..5889199 100644
+--- a/drivers/clk/qcom/gcc-sm8550.c
++++ b/drivers/clk/qcom/gcc-sm8550.c
+@@ -3003,7 +3003,7 @@ static struct gdsc pcie_0_gdsc = {
+ 	.pd = {
+ 		.name = "pcie_0_gdsc",
+ 	},
+-	.pwrsts = PWRSTS_RET_ON,
++	.pwrsts = PWRSTS_OFF_ON,
+ 	.flags = VOTABLE | POLL_CFG_GDSCR | RETAIN_FF_ENABLE,
+ };
+ 
+@@ -3014,7 +3014,7 @@ static struct gdsc pcie_0_phy_gdsc = {
+ 	.pd = {
+ 		.name = "pcie_0_phy_gdsc",
+ 	},
+-	.pwrsts = PWRSTS_RET_ON,
++	.pwrsts = PWRSTS_OFF_ON,
+ 	.flags = VOTABLE | POLL_CFG_GDSCR | RETAIN_FF_ENABLE,
+ };
+ 
